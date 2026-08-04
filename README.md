@@ -11,8 +11,6 @@ pip install -r requirements.txt
 streamlit run wind_streamlit_app.py
 ```
 
-Then open the local URL it prints (usually http://localhost:8501).
-
 ## Deploy for free (share with others) via Streamlit Community Cloud
 
 1. Push `wind_streamlit_app.py` and `requirements.txt` to a GitHub repo.
