@@ -9,6 +9,8 @@ per height) interactively - only the ERA5 file format is assumed fixed.
 Run with:  streamlit run wind_streamlit_app.py
 """
 
+import re
+
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -16,6 +18,37 @@ import streamlit as st
 from scipy import stats
 
 st.set_page_config(page_title="Wind Resource Analysis", layout="wide")
+
+# Clean, consistent plot style applied everywhere (fixes the low-res / patchy look)
+plt.rcParams.update({
+    "figure.dpi": 140,
+    "savefig.dpi": 140,
+    "axes.spines.top": False,
+    "axes.spines.right": False,
+    "axes.grid": True,
+    "grid.alpha": 0.3,
+    "axes.axisbelow": True,
+    "font.size": 10,
+    "axes.titlesize": 12,
+    "axes.titleweight": "bold",
+})
+
+ACCENT = "#2b6cb0"
+ACCENT_LIGHT = "#a0c4e8"
+FLAG = "#d64545"
+
+
+def show_fig(fig, width_frac=1.0):
+    """Render a matplotlib figure at a controlled display width, then free it."""
+    if width_frac >= 1.0:
+        st.pyplot(fig, use_container_width=True)
+    else:
+        pad = (1 - width_frac) / 2
+        cols = st.columns([pad, width_frac, pad])
+        with cols[1]:
+            st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
 
 # ==============================================================================
 # HELPERS - DATA LOADING & CLEANING
@@ -47,7 +80,6 @@ def build_measurement_df(raw_df, ts_col, dayfirst, invalid_codes):
     df = df.dropna(subset=[ts_col]).set_index(ts_col).sort_index()
     if invalid_codes:
         df = df.replace(invalid_codes, np.nan)
-    # coerce all non-timestamp columns to numeric where possible
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
     return df
@@ -97,6 +129,15 @@ def read_era5(file_bytes):
     return df
 
 
+def detect_era5_height(era5_df, default=100.0):
+    """Parses the height embedded in the ERA5 speed column name, e.g. Spd_100m_mps -> 100."""
+    for c in era5_df.columns:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*m", c)
+        if m and c.lower().startswith("spd"):
+            return float(m.group(1))
+    return default
+
+
 # ==============================================================================
 # HELPERS - DATA AVAILABILITY
 # ==============================================================================
@@ -119,6 +160,31 @@ def overall_availability(df, ws_col):
     return 100 * df[ws_col].notna().sum() / len(df)
 
 
+def plot_availability_bars(table, threshold=80.0):
+    """Small multiples: one subplot per height, sharing the month axis."""
+    heights = table.columns.tolist()
+    n = len(heights)
+    fig, axes = plt.subplots(n, 1, figsize=(max(8, 0.35 * len(table)), 1.9 * n), sharex=True)
+    if n == 1:
+        axes = [axes]
+
+    for ax, h in zip(axes, heights):
+        vals = table[h].values
+        colors = [ACCENT if v >= threshold else FLAG for v in vals]
+        ax.bar(table.index, vals, color=colors, width=0.75)
+        ax.axhline(threshold, color="gray", linestyle="--", linewidth=1)
+        ax.set_ylim(0, 105)
+        ax.set_ylabel(h, fontsize=10, fontweight="bold")
+        ax.grid(True, axis="y", alpha=0.3)
+
+    axes[-1].set_xticks(range(len(table.index)))
+    axes[-1].set_xticklabels(table.index, rotation=45, ha="right")
+    fig.suptitle(f"Data Availability by Height and Month (dashed line = {threshold:.0f}% threshold)",
+                 y=1.0 + 0.01 * n)
+    fig.tight_layout()
+    return fig
+
+
 # ==============================================================================
 # HELPERS - MONTHLY MEAN WIND SPEED
 # ==============================================================================
@@ -129,21 +195,28 @@ def plot_monthly_mean(df, ws_col, height_label, min_day_fraction=0.5, samples_pe
     valid_days = (daily_count >= samples_per_day * min_day_fraction).resample("ME").sum()
     monthly_mean = ws.resample("ME").mean()
     days_in_month = monthly_mean.index.days_in_month
-    complete = valid_days >= (days_in_month * 0.65)
+    incomplete = (valid_days.reindex(monthly_mean.index) < days_in_month * 0.65).fillna(True)
 
     labels = monthly_mean.index.strftime("%b-%Y")
-    colors = ["#2b6cb0" if c else "#a0c4e8" for c in complete.reindex(monthly_mean.index).fillna(False)]
 
-    fig, ax = plt.subplots(figsize=(max(8, 0.5 * len(monthly_mean)), 5))
-    ax.bar(labels, monthly_mean.values, color=colors)
+    fig, ax = plt.subplots(figsize=(max(9, 0.55 * len(monthly_mean)), 5))
+    bars = ax.bar(labels, monthly_mean.values, color=ACCENT, width=0.7,
+                   edgecolor="white", linewidth=0.5)
+
+    # flag incomplete months with a marker instead of a second bar colour
+    for bar, flag in zip(bars, incomplete.values):
+        if flag:
+            ax.plot(bar.get_x() + bar.get_width() / 2, bar.get_height() + 0.15,
+                    marker="*", color=FLAG, markersize=9)
+
     overall_mean = ws.mean()
-    ax.axhline(overall_mean, color="red", linestyle="--", linewidth=1,
+    ax.axhline(overall_mean, color="#444444", linestyle="--", linewidth=1.2,
                label=f"Overall mean = {overall_mean:.2f} m/s")
     ax.set_ylabel("Mean Wind Speed (m/s)")
     ax.set_title(f"Monthly Mean Wind Speed - {height_label}")
     ax.set_xticks(range(len(labels)))
     ax.set_xticklabels(labels, rotation=45, ha="right")
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(loc="upper right", fontsize=9, frameon=False)
     ax.grid(True, axis="y", alpha=0.3)
     fig.tight_layout()
     return fig, monthly_mean
@@ -178,19 +251,22 @@ def _draw_rose(ax, ws, wd, n_dir_bins, n_speed_bins, title, speed_edges=None):
     ax.set_theta_zero_location("N")
     ax.set_theta_direction(-1)
     bottoms = np.zeros(n_dir_bins)
+    cmap = plt.get_cmap("Blues")
     for i in range(len(speed_edges) - 1):
         lo, hi = speed_edges[i], speed_edges[i + 1]
         mask = (ws >= lo) & (ws < hi)
         counts = np.array([np.sum(mask & (dir_bins == d)) for d in range(n_dir_bins)])
         freq = 100 * counts / len(ws)
+        color = cmap(0.3 + 0.6 * i / max(1, len(speed_edges) - 2))
         ax.bar(theta, freq, width=np.deg2rad(dir_bin_width * 0.9), bottom=bottoms,
-               label=f"{lo:.1f}-{hi:.1f} m/s")
+               label=f"{lo:.1f}-{hi:.1f} m/s", color=color, edgecolor="white", linewidth=0.3)
         bottoms += freq
-    ax.set_title(title)
+    ax.set_title(title, pad=18)
+    ax.grid(True, alpha=0.4)
     return speed_edges
 
 
-def plot_rose_comparison(meas_ws_hourly, meas_wd_hourly, era5_ws, era5_wd, meas_label,
+def plot_rose_comparison(meas_ws_hourly, meas_wd_hourly, era5_ws, era5_wd, meas_label, era5_label,
                           n_dir_bins=16, n_speed_bins=6):
     combined = pd.concat(
         [meas_ws_hourly.rename("meas_ws"), meas_wd_hourly.rename("meas_wd"),
@@ -201,20 +277,20 @@ def plot_rose_comparison(meas_ws_hourly, meas_wd_hourly, era5_ws, era5_wd, meas_
     if len(combined) < 2:
         return None, 0
 
-    fig, axes = plt.subplots(1, 2, figsize=(12, 6), subplot_kw={"projection": "polar"})
+    fig, axes = plt.subplots(1, 2, figsize=(10, 5.2), subplot_kw={"projection": "polar"})
     shared_edges = np.linspace(0, np.nanpercentile(combined["meas_ws"], 99), n_speed_bins + 1)
     shared_edges[-1] = max(shared_edges[-1], combined["meas_ws"].max(), combined["era5_ws"].max()) + 0.1
 
     _draw_rose(axes[0], combined["meas_ws"], combined["meas_wd"], n_dir_bins, n_speed_bins,
                f"Measured - {meas_label}", speed_edges=shared_edges)
     _draw_rose(axes[1], combined["era5_ws"], combined["era5_wd"], n_dir_bins, n_speed_bins,
-               "Modelled - ERA5", speed_edges=shared_edges)
+               f"Modelled - {era5_label}", speed_edges=shared_edges)
 
     handles, labels = axes[0].get_legend_handles_labels()
     fig.legend(handles, labels, loc="lower center", ncol=n_speed_bins, fontsize=8,
-               bbox_to_anchor=(0.5, -0.03))
-    fig.suptitle(f"Wind Rose Comparison (n={len(combined)} concurrent hours)")
-    fig.tight_layout(rect=[0, 0.06, 1, 0.95])
+               bbox_to_anchor=(0.5, -0.05), frameon=False)
+    fig.suptitle(f"Wind Rose Comparison (n={len(combined)} concurrent hours)", y=1.03)
+    fig.tight_layout()
     return fig, len(combined)
 
 
@@ -244,20 +320,50 @@ def compute_shear_profile(df, height_map, min_availability=80.0):
     ws_ref = np.exp(intercept) * heights_used[0] ** slope
     ws_smooth = ws_ref * (z_smooth / heights_used[0]) ** slope
 
-    fig, ax = plt.subplots(figsize=(6.5, 6))
-    ax.plot(ws_smooth, z_smooth, color="green", linewidth=2, label="Fitted profile")
-    ax.plot(mean_ws, heights_used, "D", color="navy", markersize=7, label="Overall wind speed")
+    fig, ax = plt.subplots(figsize=(5.5, 5.5))
+    ax.plot(ws_smooth, z_smooth, color="#2f9e44", linewidth=2.2, label="Fitted profile")
+    ax.plot(mean_ws, heights_used, "D", color="navy", markersize=8, label="Overall wind speed",
+            zorder=5)
     ax.set_xlabel("Wind Speed [m/s]")
     ax.set_ylabel("Height [m]")
-    ax.set_title("Predicted vertical wind profile")
+    ax.set_title("Predicted Vertical Wind Profile")
     ax.grid(True, alpha=0.4)
-    ax.legend(loc="upper left")
+    ax.legend(loc="upper left", frameon=False)
     fig.tight_layout()
 
     return {
         "alpha": slope, "r2": r ** 2, "heights_used": heights_used,
         "excluded": excluded, "fig": fig,
     }
+
+
+def get_measurement_at_target_height(meas_df, height_map, shear_result, target_height, tolerance=2.0):
+    """
+    Returns a wind-speed time series representing the measurement at
+    target_height (e.g. the ERA5 height), so correlation is always done on a
+    matched height rather than mixing heights:
+      - if a mapped height is within `tolerance` m of target_height, use it directly
+      - otherwise, shear-extrapolate from the nearest height that was actually
+        used in the shear fit (closest to target_height, to minimise
+        extrapolation error), using the profile-method alpha
+    Returns (series, description, reference_height) or (None, reason, None).
+    """
+    for hm in height_map:
+        if abs(hm["height"] - target_height) <= tolerance:
+            return meas_df[hm["ws_col"]], f"direct measurement at {hm['height']:.0f} m", hm["height"]
+
+    if shear_result is None:
+        return None, ("no measured height matches the target height and no shear exponent "
+                       "is available to extrapolate (need >=3 heights at the chosen "
+                       "availability threshold)"), None
+
+    heights_used = shear_result["heights_used"]
+    alpha = shear_result["alpha"]
+    ref_h = min(heights_used, key=lambda h: abs(h - target_height))
+    ref_col = next(hm["ws_col"] for hm in height_map if hm["height"] == ref_h)
+    extrapolated = meas_df[ref_col] * (target_height / ref_h) ** alpha
+    desc = f"extrapolated from {ref_h:.0f} m using shear alpha={alpha:.3f}"
+    return extrapolated, desc, ref_h
 
 
 # ==============================================================================
@@ -297,15 +403,15 @@ def correlation_fig(merged, label):
     slope, intercept, r, p, se = stats.linregress(merged["ERA5"], merged["Meas"])
     r2 = r ** 2
 
-    fig, ax = plt.subplots(figsize=(5.5, 5.5))
-    ax.scatter(merged["ERA5"], merged["Meas"], s=10, alpha=0.4)
+    fig, ax = plt.subplots(figsize=(4.8, 4.8))
+    ax.scatter(merged["ERA5"], merged["Meas"], s=12, alpha=0.45, color=ACCENT,
+               edgecolor="none")
     xr = np.linspace(merged["ERA5"].min(), merged["ERA5"].max(), 50)
-    ax.plot(xr, slope * xr + intercept, color="red", label=f"OLS fit (R2={r2:.2f})")
+    ax.plot(xr, slope * xr + intercept, color=FLAG, linewidth=2, label=f"OLS fit (R2={r2:.2f})")
     ax.set_xlabel("ERA5 Wind Speed (m/s)")
     ax.set_ylabel("Measured Wind Speed (m/s)")
-    ax.set_title(f"Correlation - {label}")
-    ax.legend()
-    ax.grid(True, alpha=0.3)
+    ax.set_title(label)
+    ax.legend(frameon=False, fontsize=9)
     fig.tight_layout()
     stats_dict = {"n": len(merged), "R": r, "R2": r2, "slope": slope, "intercept": intercept}
     return fig, stats_dict
@@ -351,10 +457,12 @@ st.caption("Upload your measurement data and ERA5 reanalysis data to get availab
 
 # ------------------------------------------------------------------ STEP 1 --
 st.header("1. Upload measurement data")
-meas_file = st.file_uploader("Measurement CSV (lidar / met mast, any column layout)", type="csv")
+meas_file = st.file_uploader("Measurement CSV (lidar / met mast, any column layout, up to 500MB)",
+                              type="csv")
 
 if meas_file is not None:
-    raw_df = read_raw_csv(meas_file.getvalue())
+    with st.spinner("Reading measurement file..."):
+        raw_df = read_raw_csv(meas_file.getvalue())
     st.write("Preview:")
     st.dataframe(raw_df.head(5), use_container_width=True)
 
@@ -389,12 +497,13 @@ if meas_file is not None:
         height_map.append({"height": h, "ws_col": ws_c,
                             "wd_col": None if wd_c == "(none)" else wd_c})
 
-    meas_df = build_measurement_df(raw_df, ts_col, dayfirst, invalid_codes)
-    res_minutes = detect_resolution_minutes(meas_df.index)
-    samples_per_hour = max(1, round(60 / res_minutes))
-    samples_per_day = samples_per_hour * 24
+    with st.spinner("Parsing timestamps and cleaning data..."):
+        meas_df = build_measurement_df(raw_df, ts_col, dayfirst, invalid_codes)
+        res_minutes = detect_resolution_minutes(meas_df.index)
+        samples_per_hour = max(1, round(60 / res_minutes))
+        samples_per_day = samples_per_hour * 24
+        diag = diagnose_timestamp_parsing(raw_df, ts_col, dayfirst)
 
-    diag = diagnose_timestamp_parsing(raw_df, ts_col, dayfirst)
     st.write(f"Parsed timestamp range: **{diag['chosen_range'][0]}** to "
              f"**{diag['chosen_range'][1]}** "
              f"({diag['chosen_na']} unparseable rows dropped, "
@@ -426,24 +535,53 @@ if meas_file is not None:
         value=0.0, step=0.5)
 
     if era5_file is not None:
-        era5_df = read_era5(era5_file.getvalue())
+        with st.spinner("Reading ERA5 file..."):
+            era5_df = read_era5(era5_file.getvalue())
+            era5_speed_col, era5_dir_col = "Spd_100m_mps", "Dir_100m_deg"
+            detected_era5_height = detect_era5_height(era5_df, default=100.0)
 
-        # Shift measurement index into UTC to align with ERA5
         meas_df_utc = meas_df.copy()
         meas_df_utc.index = meas_df_utc.index - pd.Timedelta(hours=utc_offset)
 
         st.divider()
-        st.header("3. Results")
+        st.header("3. Analysis settings")
+        st.caption("These settings feed the Shear, Correlation and Long-Term tabs below.")
+        s1, s2 = st.columns(2)
+        with s1:
+            min_avail = st.slider("Minimum data availability to include a height in the "
+                                   "shear fit (%)", 0, 100, 80)
+        with s2:
+            era5_height = st.number_input(
+                "ERA5 height (m) - auto-detected from the column name, override if needed",
+                min_value=1.0, value=detected_era5_height, step=1.0)
+
+        with st.spinner("Fitting shear profile..."):
+            shear_result = compute_shear_profile(meas_df, height_map, min_availability=min_avail)
+        if shear_result is not None:
+            st.success(f"Shear exponent (alpha) = {shear_result['alpha']:.3f}  |  "
+                       f"heights used: {sorted(shear_result['heights_used'])}")
+        else:
+            st.warning("Fewer than 3 heights meet the availability threshold - shear-dependent "
+                       "results (extrapolation, long-term at non-matching heights) won't be "
+                       "available until this is resolved.")
+
+        st.divider()
+        st.header("4. Results")
 
         tabs = st.tabs(["Data Availability", "Monthly Means", "Wind Rose", "Shear Profile",
                          "Correlation", "Long-Term Result"])
 
         # ---- Data availability ----
         with tabs[0]:
-            st.subheader("Data availability by height and month (%)")
-            table = availability_table(meas_df, height_map)
-            st.dataframe(table.style.background_gradient(cmap="RdYlGn", vmin=0, vmax=100)
-                         .format("{:.1f}"), use_container_width=True)
+            st.subheader("Data availability by height and month")
+            with st.spinner("Building availability chart..."):
+                table = availability_table(meas_df, height_map)
+                fig = plot_availability_bars(table, threshold=min_avail)
+            show_fig(fig, width_frac=1.0)
+            st.download_button(
+                "Download availability table (CSV)",
+                table.to_csv().encode("utf-8"),
+                file_name="data_availability.csv", mime="text/csv")
 
         # ---- Monthly means ----
         with tabs[1]:
@@ -451,9 +589,11 @@ if meas_file is not None:
             mm_height = st.selectbox(
                 "Height", [f"{hm['height']:.0f} m" for hm in height_map], key="mm_height")
             hm_sel = next(hm for hm in height_map if f"{hm['height']:.0f} m" == mm_height)
-            fig, monthly_mean = plot_monthly_mean(meas_df, hm_sel["ws_col"], mm_height,
-                                                   samples_per_day=samples_per_day)
-            st.pyplot(fig)
+            with st.spinner("Building monthly means chart..."):
+                fig, monthly_mean = plot_monthly_mean(meas_df, hm_sel["ws_col"], mm_height,
+                                                       samples_per_day=samples_per_day)
+            show_fig(fig, width_frac=1.0)
+            st.caption("Red star = month with materially incomplete data (<65% of expected days).")
 
         # ---- Wind rose ----
         with tabs[2]:
@@ -469,65 +609,77 @@ if meas_file is not None:
                 hm_r = next(hm for hm in rose_heights
                             if f"{hm['height']:.0f} m" == rose_height_label)
 
-                meas_ws_hourly = resample_to_hourly(meas_df_utc[hm_r["ws_col"]], samples_per_hour)
-                meas_wd_hourly = meas_df_utc[hm_r["wd_col"]].resample("h").apply(circular_mean_deg)
-
-                fig, n = plot_rose_comparison(
-                    meas_ws_hourly, meas_wd_hourly,
-                    era5_df["Spd_100m_mps"], era5_df["Dir_100m_deg"], rose_height_label)
+                with st.spinner("Building wind rose comparison..."):
+                    meas_ws_hourly = resample_to_hourly(meas_df_utc[hm_r["ws_col"]], samples_per_hour)
+                    meas_wd_hourly = meas_df_utc[hm_r["wd_col"]].resample("h").apply(circular_mean_deg)
+                    fig, n = plot_rose_comparison(
+                        meas_ws_hourly, meas_wd_hourly,
+                        era5_df[era5_speed_col], era5_df[era5_dir_col],
+                        rose_height_label, f"ERA5 ({era5_height:.0f} m)")
                 if fig is None:
                     st.warning("Not enough concurrent data between measurement and ERA5 "
                                "to build a comparison wind rose.")
                 else:
-                    st.pyplot(fig)
+                    show_fig(fig, width_frac=0.85)
+                    if abs(hm_r["height"] - era5_height) > 2:
+                        st.caption(f"Note: the measured panel is at {hm_r['height']:.0f} m and the "
+                                   f"modelled panel is at ERA5's height ({era5_height:.0f} m) - "
+                                   "the two are shown side by side but not height-matched, since "
+                                   "wind rose is primarily about directional shape.")
 
         # ---- Shear ----
         with tabs[3]:
             st.subheader("Shear exponent (profile method)")
-            min_avail = st.slider("Minimum data availability to include a height (%)",
-                                   0, 100, 80)
-            result = compute_shear_profile(meas_df, height_map, min_availability=min_avail)
-            if result is None:
+            st.caption(f"Using the availability threshold set above ({min_avail}%).")
+            if shear_result is None:
                 st.warning("Fewer than 3 heights meet the availability threshold - "
-                           "lower the threshold or check your data.")
-                alpha = None
+                           "lower the threshold above or check your data.")
             else:
-                alpha = result["alpha"]
-                st.metric("Shear exponent (alpha)", f"{alpha:.3f}", help=f"R2 = {result['r2']:.3f}")
-                st.write(f"Heights used: {sorted(result['heights_used'])}")
-                if result["excluded"]:
-                    st.write(f"Heights excluded (availability %): {result['excluded']}")
-                st.pyplot(result["fig"])
+                st.metric("Shear exponent (alpha)", f"{shear_result['alpha']:.3f}",
+                          help=f"R2 = {shear_result['r2']:.3f}")
+                st.write(f"Heights used: {sorted(shear_result['heights_used'])}")
+                if shear_result["excluded"]:
+                    st.write(f"Heights excluded (availability %): {shear_result['excluded']}")
+                show_fig(shear_result["fig"], width_frac=0.5)
 
         # ---- Correlation ----
         with tabs[4]:
             st.subheader("Correlation with ERA5")
-            corr_height_label = st.selectbox(
-                "Height to correlate against ERA5",
-                [f"{hm['height']:.0f} m" for hm in height_map], key="corr_height")
-            hm_c = next(hm for hm in height_map
-                        if f"{hm['height']:.0f} m" == corr_height_label)
+            st.caption(f"Correlation is always done at ERA5's height ({era5_height:.0f} m), "
+                       "so measurement and model are compared like-for-like.")
 
-            meas_hourly = resample_to_hourly(meas_df_utc[hm_c["ws_col"]], samples_per_hour)
-            merged_hourly = merge_concurrent(meas_hourly, era5_df["Spd_100m_mps"])
+            with st.spinner("Matching measurement height to ERA5..."):
+                target_series, desc, ref_h = get_measurement_at_target_height(
+                    meas_df_utc, height_map, shear_result, era5_height)
 
-            if len(merged_hourly) < 2:
-                st.warning("No concurrent overlap found between measurement and ERA5 data. "
-                           "Check the timezone offset and date ranges.")
+            if target_series is None:
+                st.warning(f"Cannot build a series at {era5_height:.0f} m: {desc}.")
             else:
-                colA, colB, colC = st.columns(3)
-                for col, (label, data) in zip(
-                        [colA, colB, colC],
-                        [("Hourly", merged_hourly),
-                         ("Daily Average", build_daily_monthly(merged_hourly)[0]),
-                         ("Monthly Average", build_daily_monthly(merged_hourly)[1])]):
-                    with col:
-                        fig, stats_dict = correlation_fig(data, label)
-                        if fig is None:
-                            st.warning(f"Not enough data for {label} correlation.")
-                        else:
-                            st.pyplot(fig)
-                            st.write(f"n={stats_dict['n']}, R2={stats_dict['R2']:.3f}")
+                st.info(f"Using measurement at {era5_height:.0f} m ({desc}).")
+
+                with st.spinner("Resampling and correlating..."):
+                    meas_hourly = resample_to_hourly(target_series, samples_per_hour)
+                    merged_hourly = merge_concurrent(meas_hourly, era5_df[era5_speed_col])
+                    daily_avg, monthly_avg = build_daily_monthly(merged_hourly) \
+                        if len(merged_hourly) >= 2 else (pd.DataFrame(), pd.DataFrame())
+
+                if len(merged_hourly) < 2:
+                    st.warning("No concurrent overlap found between measurement and ERA5 data. "
+                               "Check the timezone offset and date ranges.")
+                else:
+                    colA, colB, colC = st.columns(3)
+                    for col, (label, data) in zip(
+                            [colA, colB, colC],
+                            [("Hourly", merged_hourly),
+                             ("Daily Average", daily_avg),
+                             ("Monthly Average", monthly_avg)]):
+                        with col:
+                            fig, stats_dict = correlation_fig(data, label)
+                            if fig is None:
+                                st.warning(f"Not enough data for {label} correlation.")
+                            else:
+                                show_fig(fig, width_frac=1.0)
+                                st.caption(f"n={stats_dict['n']}, R2={stats_dict['R2']:.3f}")
 
         # ---- Long-term result ----
         with tabs[5]:
@@ -535,46 +687,51 @@ if meas_file is not None:
             interest_height = st.number_input("Height of interest (m)", min_value=1.0,
                                                value=float(height_map[0]["height"]))
 
-            corr_height_label2 = st.selectbox(
-                "Measured height used for the ERA5 correlation",
-                [f"{hm['height']:.0f} m" for hm in height_map], key="lt_corr_height")
-            hm_lt = next(hm for hm in height_map
-                         if f"{hm['height']:.0f} m" == corr_height_label2)
+            with st.spinner("Computing long-term correction..."):
+                target_series, desc, ref_h = get_measurement_at_target_height(
+                    meas_df_utc, height_map, shear_result, era5_height)
 
-            meas_hourly_lt = resample_to_hourly(meas_df_utc[hm_lt["ws_col"]], samples_per_hour)
-            merged_lt = merge_concurrent(meas_hourly_lt, era5_df["Spd_100m_mps"])
-
-            shear_result = compute_shear_profile(meas_df, height_map, min_availability=80.0)
-
-            if len(merged_lt) < 2:
-                st.warning("No concurrent overlap - cannot run the long-term correction.")
+            if target_series is None:
+                st.warning(f"Cannot build a series at {era5_height:.0f} m: {desc}.")
             elif shear_result is None:
-                st.warning("Shear exponent could not be computed (need >=3 heights at "
-                           ">=80% availability) - cannot extrapolate to the height of interest.")
+                st.warning("Shear exponent could not be computed (need >=3 heights at the "
+                           "chosen availability threshold) - cannot extrapolate to the "
+                           "height of interest.")
             else:
-                lt = long_term_correction(merged_lt, era5_df["Spd_100m_mps"])
-                alpha = shear_result["alpha"]
+                with st.spinner("Running long-term regression..."):
+                    meas_hourly_lt = resample_to_hourly(target_series, samples_per_hour)
+                    merged_lt = merge_concurrent(meas_hourly_lt, era5_df[era5_speed_col])
 
-                lt_ws_at_corr_height = lt["tls"]["lt_mean"]
-                lt_ws_at_interest = lt_ws_at_corr_height * (interest_height / hm_lt["height"]) ** alpha
+                if len(merged_lt) < 2:
+                    st.warning("No concurrent overlap - cannot run the long-term correction.")
+                else:
+                    lt = long_term_correction(merged_lt, era5_df[era5_speed_col])
+                    alpha = shear_result["alpha"]
 
-                st.write(f"Concurrent period: {lt['n_concurrent']} hours "
-                         f"(concurrent mean measured = {lt['concurrent_meas_mean']:.3f} m/s, "
-                         f"concurrent mean ERA5 = {lt['concurrent_era5_mean']:.3f} m/s)")
-                st.write(f"Full ERA5 record: {lt['lt_era5_start'].date()} to "
-                         f"{lt['lt_era5_end'].date()}, long-term mean ERA5 = "
-                         f"{lt['lt_era5_mean']:.3f} m/s")
+                    lt_ws_at_era5_height = lt["tls"]["lt_mean"]
+                    lt_ws_at_interest = lt_ws_at_era5_height * (interest_height / era5_height) ** alpha
 
-                st.metric(f"Long-term wind speed at {hm_lt['height']:.0f} m (correlation height)",
-                          f"{lt_ws_at_corr_height:.3f} m/s")
-                st.metric(f"Long-term wind speed at {interest_height:.0f} m "
-                          f"(shear-extrapolated, alpha={alpha:.3f})",
-                          f"{lt_ws_at_interest:.3f} m/s")
+                    st.write(f"Correlation basis: measurement at {era5_height:.0f} m ({desc}).")
+                    st.write(f"Concurrent period: {lt['n_concurrent']} hours "
+                             f"(concurrent mean measured = {lt['concurrent_meas_mean']:.3f} m/s, "
+                             f"concurrent mean ERA5 = {lt['concurrent_era5_mean']:.3f} m/s)")
+                    st.write(f"Full ERA5 record: {lt['lt_era5_start'].date()} to "
+                             f"{lt['lt_era5_end'].date()}, long-term mean ERA5 = "
+                             f"{lt['lt_era5_mean']:.3f} m/s")
 
-                st.caption(f"For reference, OLS fit gives a long-term mean of "
-                           f"{lt['ols']['lt_mean']:.3f} m/s at {hm_lt['height']:.0f} m. "
-                           "The orthogonal (TLS) result above is used as the primary "
-                           "estimate since OLS understates slope when both series carry "
-                           "noise.")
+                    m1, m2 = st.columns(2)
+                    with m1:
+                        st.metric(f"Long-term wind speed at {era5_height:.0f} m (ERA5 height)",
+                                  f"{lt_ws_at_era5_height:.3f} m/s")
+                    with m2:
+                        st.metric(f"Long-term wind speed at {interest_height:.0f} m "
+                                  f"(shear-extrapolated, alpha={alpha:.3f})",
+                                  f"{lt_ws_at_interest:.3f} m/s")
+
+                    st.caption(f"For reference, OLS fit gives a long-term mean of "
+                               f"{lt['ols']['lt_mean']:.3f} m/s at {era5_height:.0f} m. "
+                               "The orthogonal (TLS) result above is used as the primary "
+                               "estimate since OLS understates slope when both series carry "
+                               "noise.")
 else:
     st.info("Upload a measurement CSV to begin.")
