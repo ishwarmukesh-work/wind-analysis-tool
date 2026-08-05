@@ -36,12 +36,12 @@ FLAG = "#d64545"
 PLOT_DPI = 300  # st.pyplot ignores rcParams and defaults to dpi=200 internally,
                 # so this must be passed explicitly on every call to get sharp output.
 
-# Fixed display widths (px) - deliberately NOT "stretch", since letting these grow
-# to fill a wide container was what made them look oversized/distorted before.
+# Wind rose and shear are fixed-width (portrait/square plots that shouldn't stretch).
+# Availability and Monthly Means stretch to the container (so they're not undersized on
+# a wide screen), but their internal figsize is capped below so the aspect ratio itself
+# can't run away and look oversized/distorted the way it did before.
 WIDTH_ROSE = 800
 WIDTH_SHEAR = 500
-WIDTH_AVAILABILITY = 900
-WIDTH_MONTHLY = 900
 
 
 def show_fig(fig, width="stretch"):
@@ -183,10 +183,10 @@ def overall_availability(df, ws_col):
 def plot_availability_bars(table, threshold=80.0):
     heights = table.columns.tolist()
     n = len(heights)
-    # Fixed-ish internal aspect ratio (capped) - actual on-screen size is controlled
-    # separately by the fixed display width this gets shown at, not by these inches.
-    fig_w = min(max(7, 0.28 * len(table)), 13)
-    fig_h = min(1.15 * n, 8)
+    fig_w = min(max(8, 0.3 * len(table)), 14)
+    # Bound height/width ratio directly so more heights can't make this run tall when
+    # stretched to fill a wide container - this was the actual cause of "massive" before.
+    fig_h = min(1.1 * n, 0.5 * fig_w, 7)
     fig, axes = plt.subplots(n, 1, figsize=(fig_w, fig_h), sharex=True)
     if n == 1:
         axes = [axes]
@@ -225,9 +225,10 @@ def monthly_mean_data(df, ws_col, min_day_fraction=0.5, samples_per_day=144):
 
 def render_monthly_fig(monthly_mean, incomplete, overall_mean, height_label):
     labels = monthly_mean.index.strftime("%b-%Y")
-    fig_w = min(max(7, 0.35 * len(monthly_mean)), 13)
+    fig_w = min(max(8, 0.35 * len(monthly_mean)), 14)
+    fig_h = min(0.35 * fig_w, 5)
 
-    fig, ax = plt.subplots(figsize=(fig_w, 4.3))
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
     bars = ax.bar(labels, monthly_mean.values, color=ACCENT, width=0.7,
                    edgecolor="white", linewidth=0.5)
 
@@ -622,7 +623,7 @@ if meas_file is not None:
             st.subheader("Data availability by height and month")
             table = availability_table(meas_df, height_map)
             fig = plot_availability_bars(table, threshold=min_avail)
-            show_fig(fig, width=WIDTH_AVAILABILITY)
+            show_fig(fig, width="stretch")
             st.download_button(
                 "Download availability table (CSV)",
                 table.to_csv().encode("utf-8"),
@@ -636,7 +637,7 @@ if meas_file is not None:
             monthly_mean, incomplete, overall_mean = monthly_mean_data(
                 meas_df, hm_sel["ws_col"], samples_per_day=samples_per_day)
             fig = render_monthly_fig(monthly_mean, incomplete, overall_mean, mm_height)
-            show_fig(fig, width=WIDTH_MONTHLY)
+            show_fig(fig, width="stretch")
             st.caption("Red star = month with materially incomplete data (<65% of expected days).")
 
         # ---- Wind rose ----
