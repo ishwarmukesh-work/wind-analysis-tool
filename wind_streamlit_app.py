@@ -183,10 +183,10 @@ def overall_availability(df, ws_col):
 def plot_availability_bars(table, threshold=80.0):
     heights = table.columns.tolist()
     n = len(heights)
-    fig_w = min(max(6, 0.3 * len(table)), 14)
+    fig_w = min(max(3, 0.3 * len(table)), 14)
     # Bound height/width ratio directly so more heights can't make this run tall when
     # stretched to fill a wide container - this was the actual cause of "massive" before.
-    fig_h = min(1.0 * n, 0.5 * fig_w, 7)
+    fig_h = min(0.8 * n, 0.5 * fig_w, 7)
     fig, axes = plt.subplots(n, 1, figsize=(fig_w, fig_h), sharex=True)
     if n == 1:
         axes = [axes]
