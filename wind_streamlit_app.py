@@ -33,7 +33,7 @@ plt.rcParams.update({
 
 ACCENT = "#2b6cb0"
 FLAG = "#d64545"
-PLOT_DPI = 300  # st.pyplot ignores rcParams and defaults to dpi=200 internally,
+PLOT_DPI = 800  # st.pyplot ignores rcParams and defaults to dpi=200 internally,
                 # so this must be passed explicitly on every call to get sharp output.
 
 # Wind rose and shear are fixed-width (portrait/square plots that shouldn't stretch).
