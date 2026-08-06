@@ -93,6 +93,69 @@ def read_raw_csv(file_bytes):
     return pd.read_csv(pd.io.common.BytesIO(file_bytes))
 
 
+def sniff_vortex_format(file_bytes):
+    """Vortex text exports start with a metadata block (Lat=.. Lon=.. Hub-Height=..,
+    a 'VORTEX (www.vortexfdc.com)...' line) before the real header row - detect
+    that rather than relying on file extension alone."""
+    head = file_bytes[:2000].decode("utf-8", errors="ignore")
+    return ("hub-height" in head.lower() and "yyyymmdd" in head.lower()) or \
+           "vortexfdc" in head.lower()
+
+
+@st.cache_data(show_spinner="Parsing Vortex file...")
+def parse_vortex_txt(file_bytes):
+    """
+    Parses a Vortex-format whitespace-delimited .txt export:
+      - a few metadata lines (Lat=.. Lon=.. Hub-Height=.. Timezone=.. ...)
+      - a header row starting with YYYYMMDD HHMM
+      - whitespace-delimited data, with date and time in separate columns
+    Combines YYYYMMDD + HHMM into a single 'Timestamp' column automatically,
+    and pulls Hub-Height / Timezone out of the metadata for auto-fill.
+    Returns (df, detected_height, detected_tz_offset).
+    """
+    text = file_bytes.decode("utf-8", errors="ignore")
+    lines = text.splitlines()
+
+    detected_height = 100.0
+    detected_tz = 0.0
+    header_idx = None
+    for i, line in enumerate(lines):
+        m = re.search(r"Hub-Height\s*=\s*([\d.]+)", line, flags=re.IGNORECASE)
+        if m:
+            detected_height = float(m.group(1))
+        m = re.search(r"Timezone\s*=\s*(-?[\d.]+)", line, flags=re.IGNORECASE)
+        if m:
+            detected_tz = float(m.group(1))
+        if line.strip().upper().startswith("YYYYMMDD"):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        header_idx = 3  # fallback matching Vortex's usual 3 metadata lines
+
+    from io import StringIO
+    data_text = "\n".join(lines[header_idx:])
+    df = pd.read_csv(StringIO(data_text), sep=r"\s+", engine="python")
+
+    date_col, time_col = df.columns[0], df.columns[1]
+    ts = pd.to_datetime(
+        df[date_col].astype(str) + df[time_col].astype(str).str.zfill(4),
+        format="%Y%m%d%H%M", errors="coerce")
+    df.insert(0, "Timestamp", ts)
+    df = df.drop(columns=[date_col, time_col])
+    return df, detected_height, detected_tz
+
+
+def guess_column(cols, keywords, default_idx=0):
+    """Best-effort default selection for a selectbox - e.g. picks 'M(m/s)' for
+    wind speed, 'D(deg)' for direction - always overridable by the user."""
+    for kw in keywords:
+        for i, c in enumerate(cols):
+            if kw.lower() in c.lower():
+                return i
+    return default_idx
+
+
 @st.cache_data(show_spinner="Parsing timestamps and cleaning data...")
 def build_clean_df(raw_df, ts_col, dayfirst, invalid_codes):
     """Generic cleaner - used for both the measurement file and the modelled
@@ -544,53 +607,113 @@ if meas_file is not None:
     # -------------------------------------------------------------- STEP 2 --
     st.header("2. Upload modelled wind data")
     st.caption("Any hourly modelled/reanalysis wind time series works here - ERA5, CFSR, "
-               "MERRA-2, or similar - you map its columns just like the measurement file.")
-    model_file = st.file_uploader("Modelled wind dataset CSV", type="csv", key="model_file")
+               "MERRA-2, Vortex, or similar.")
+    model_file = st.file_uploader("Modelled wind dataset file (CSV or Vortex .txt)",
+                                   type=["csv", "txt"], key="model_file")
 
     if model_file is not None:
-        raw_model_df = read_raw_csv(model_file.getvalue())
-        st.write("Preview:")
-        st.dataframe(raw_model_df.head(5), use_container_width=True)
+        model_bytes = model_file.getvalue()
+        is_vortex = sniff_vortex_format(model_bytes)
 
-        model_cols = list(raw_model_df.columns)
+        if is_vortex:
+            raw_model_df, vortex_height, vortex_tz = parse_vortex_txt(model_bytes)
+            st.success(f"Detected a Vortex-format file - timestamp auto-combined from "
+                       f"YYYYMMDD + HHMM, Hub-Height={vortex_height:.0f} m and "
+                       f"Timezone=UTC{vortex_tz:+.1f} read from the file header "
+                       "(both editable below).")
+            st.write("Preview:")
+            st.dataframe(raw_model_df.head(5), use_container_width=True)
 
-        st.subheader("2a. Column mapping")
-        mc1, mc2 = st.columns(2)
-        with mc1:
-            model_ts_col = st.selectbox("Timestamp column", model_cols, key="model_ts_col")
-            model_dayfirst = st.checkbox("Date format is day-first (DD/MM/YYYY)",
-                                          value=False, key="model_dayfirst")
-            model_invalid_text = st.text_input(
-                "Invalid/missing value codes (comma-separated, optional)",
-                value="", key="model_invalid")
-        with mc2:
-            model_ws_col = st.selectbox("Wind speed column", model_cols, key="model_ws_col")
-            model_wd_choice = st.selectbox("Wind direction column (optional, for wind rose)",
-                                            ["(none)"] + model_cols, key="model_wd_col")
-            model_wd_col = None if model_wd_choice == "(none)" else model_wd_choice
+            model_cols = [c for c in raw_model_df.columns if c != "Timestamp"]
+            model_ts_col, model_dayfirst = "Timestamp", False
 
-        mc3, mc4 = st.columns(2)
-        with mc3:
-            model_height = st.number_input(
-                "Height of the modelled wind dataset (m)", min_value=1.0,
-                value=detect_height_from_colname(model_ws_col, default=100.0), step=1.0,
-                key="model_height")
-        with mc4:
-            model_label = st.text_input("Dataset name (for labeling charts, e.g. ERA5, CFSR)",
-                                         value="Modelled", key="model_label")
+            st.subheader("2a. Column mapping")
+            st.caption("Timestamp is already handled automatically for Vortex files - just "
+                       "confirm the wind speed and direction columns.")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                ws_idx = guess_column(model_cols, ["m/s", "wspd", "speed"])
+                model_ws_col = st.selectbox("Wind speed column", model_cols, index=ws_idx,
+                                             key="model_ws_col_vortex")
+                model_invalid_text = st.text_input(
+                    "Invalid/missing value codes (comma-separated, optional)",
+                    value="", key="model_invalid_vortex")
+            with mc2:
+                wd_options = ["(none)"] + model_cols
+                wd_idx = guess_column(model_cols, ["deg", "wdir", "direction"])
+                model_wd_choice = st.selectbox("Wind direction column (optional, for wind rose)",
+                                                wd_options, index=wd_idx + 1,
+                                                key="model_wd_col_vortex")
+                model_wd_col = None if model_wd_choice == "(none)" else model_wd_choice
+
+            mc3, mc4 = st.columns(2)
+            with mc3:
+                model_height = st.number_input(
+                    "Height of the modelled wind dataset (m)", min_value=1.0,
+                    value=vortex_height, step=1.0, key="model_height_vortex")
+            with mc4:
+                model_label = st.text_input("Dataset name (for labeling charts)",
+                                             value="Vortex", key="model_label_vortex")
+
+            model_tz_default = vortex_tz
+        else:
+            raw_model_df = read_raw_csv(model_bytes)
+            st.write("Preview:")
+            st.dataframe(raw_model_df.head(5), use_container_width=True)
+
+            model_cols = list(raw_model_df.columns)
+
+            st.subheader("2a. Column mapping")
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                model_ts_col = st.selectbox("Timestamp column", model_cols, key="model_ts_col")
+                model_dayfirst = st.checkbox("Date format is day-first (DD/MM/YYYY)",
+                                              value=False, key="model_dayfirst")
+                model_invalid_text = st.text_input(
+                    "Invalid/missing value codes (comma-separated, optional)",
+                    value="", key="model_invalid")
+            with mc2:
+                model_ws_col = st.selectbox("Wind speed column", model_cols, key="model_ws_col")
+                model_wd_choice = st.selectbox("Wind direction column (optional, for wind rose)",
+                                                ["(none)"] + model_cols, key="model_wd_col")
+                model_wd_col = None if model_wd_choice == "(none)" else model_wd_choice
+
+            mc3, mc4 = st.columns(2)
+            with mc3:
+                model_height = st.number_input(
+                    "Height of the modelled wind dataset (m)", min_value=1.0,
+                    value=detect_height_from_colname(model_ws_col, default=100.0), step=1.0,
+                    key="model_height")
+            with mc4:
+                model_label = st.text_input("Dataset name (for labeling charts, e.g. ERA5, CFSR)",
+                                             value="Modelled", key="model_label")
+
+            model_tz_default = 0.0
 
         model_invalid_codes = parse_invalid_codes(model_invalid_text)
         model_df = build_clean_df(raw_model_df, model_ts_col, model_dayfirst,
                                    tuple(model_invalid_codes))
-        timestamp_diagnostics_ui(raw_model_df, model_ts_col, model_dayfirst, key_prefix="model")
+        if not is_vortex:
+            timestamp_diagnostics_ui(raw_model_df, model_ts_col, model_dayfirst, key_prefix="model")
 
-        utc_offset = st.number_input(
-            "Measurement timezone offset from UTC (hours). E.g. enter 8 if your measurement "
-            "timestamps are UTC+8. The modelled dataset is assumed to be UTC.",
-            value=0.0, step=0.5)
+        st.subheader("2b. Timezone alignment")
+        tzc1, tzc2 = st.columns(2)
+        with tzc1:
+            utc_offset = st.number_input(
+                "Measurement timezone offset from UTC (hours). E.g. enter 8 if your "
+                "measurement timestamps are UTC+8.", value=0.0, step=0.5, key="meas_utc_offset")
+        with tzc2:
+            model_utc_offset = st.number_input(
+                "Modelled dataset timezone offset from UTC (hours). Most reanalysis products "
+                "(ERA5, CFSR, MERRA-2) are already UTC (0); Vortex files are typically in "
+                "local time and this is pre-filled from the file header.",
+                value=model_tz_default, step=0.5, key="model_utc_offset")
 
         meas_df_utc = meas_df.copy()
         meas_df_utc.index = meas_df_utc.index - pd.Timedelta(hours=utc_offset)
+
+        model_df_utc = model_df.copy()
+        model_df_utc.index = model_df_utc.index - pd.Timedelta(hours=model_utc_offset)
 
         meas_series_by_height = {}
         for hm in sorted_heights(height_map):
@@ -661,7 +784,7 @@ if meas_file is not None:
 
                 combined = rose_source_data(
                     meas_df_utc[hm_r["ws_col"]], meas_df_utc[hm_r["wd_col"]],
-                    model_df[model_ws_col], model_df[model_wd_col], samples_per_hour)
+                    model_df_utc[model_ws_col], model_df_utc[model_wd_col], samples_per_hour)
                 fig = render_rose_fig(combined, rose_height_label,
                                        f"{model_label} ({model_height:.0f} m)")
 
@@ -708,7 +831,7 @@ if meas_file is not None:
             else:
                 st.info(f"Using measurement at {model_height:.0f} m ({desc}).")
 
-                merged_hourly = merge_concurrent(target_series, model_df[model_ws_col])
+                merged_hourly = merge_concurrent(target_series, model_df_utc[model_ws_col])
                 daily_avg, monthly_avg = build_daily_monthly(merged_hourly) \
                     if len(merged_hourly) >= 2 else (pd.DataFrame(), pd.DataFrame())
 
@@ -746,12 +869,12 @@ if meas_file is not None:
                            "chosen availability threshold) - cannot extrapolate to the "
                            "height of interest.")
             else:
-                merged_lt = merge_concurrent(target_series, model_df[model_ws_col])
+                merged_lt = merge_concurrent(target_series, model_df_utc[model_ws_col])
 
                 if len(merged_lt) < 2:
                     st.warning("No concurrent overlap - cannot run the long-term correction.")
                 else:
-                    lt = long_term_correction(merged_lt, model_df[model_ws_col])
+                    lt = long_term_correction(merged_lt, model_df_utc[model_ws_col])
                     alpha = shear_data["alpha"]
 
                     lt_ws_at_model_height = lt["tls"]["lt_mean"]
