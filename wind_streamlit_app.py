@@ -11,6 +11,8 @@ Run with:  streamlit run wind_streamlit_app.py
 """
 
 import re
+import io
+import zipfile
 
 import numpy as np
 import pandas as pd
@@ -49,6 +51,14 @@ WIDTH_MONTHLY = 1200
 def show_fig(fig, width="stretch"):
     st.pyplot(fig, width=width, dpi=PLOT_DPI)
     plt.close(fig)
+
+
+def fig_to_png_bytes(fig, dpi=PLOT_DPI):
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", dpi=dpi, bbox_inches="tight")
+    plt.close(fig)
+    buf.seek(0)
+    return buf.read()
 
 
 def sorted_heights(height_map):
@@ -110,14 +120,15 @@ def parse_vortex_txt(file_bytes):
       - a header row starting with YYYYMMDD HHMM
       - whitespace-delimited data, with date and time in separate columns
     Combines YYYYMMDD + HHMM into a single 'Timestamp' column automatically,
-    and pulls Hub-Height / Timezone out of the metadata for auto-fill.
-    Returns (df, detected_height, detected_tz_offset).
+    and pulls Lat / Lon / Hub-Height / Timezone out of the metadata for auto-fill.
+    Returns (df, detected_height, detected_tz_offset, detected_lat, detected_lon).
     """
     text = file_bytes.decode("utf-8", errors="ignore")
     lines = text.splitlines()
 
     detected_height = 100.0
     detected_tz = 0.0
+    detected_lat, detected_lon = None, None
     header_idx = None
     for i, line in enumerate(lines):
         m = re.search(r"Hub-Height\s*=\s*([\d.]+)", line, flags=re.IGNORECASE)
@@ -126,6 +137,12 @@ def parse_vortex_txt(file_bytes):
         m = re.search(r"Timezone\s*=\s*(-?[\d.]+)", line, flags=re.IGNORECASE)
         if m:
             detected_tz = float(m.group(1))
+        m = re.search(r"\bLat\s*=\s*(-?[\d.]+)", line, flags=re.IGNORECASE)
+        if m:
+            detected_lat = float(m.group(1))
+        m = re.search(r"\bLon\s*=\s*(-?[\d.]+)", line, flags=re.IGNORECASE)
+        if m:
+            detected_lon = float(m.group(1))
         if line.strip().upper().startswith("YYYYMMDD"):
             header_idx = i
             break
@@ -143,7 +160,7 @@ def parse_vortex_txt(file_bytes):
         format="%Y%m%d%H%M", errors="coerce")
     df.insert(0, "Timestamp", ts)
     df = df.drop(columns=[date_col, time_col])
-    return df, detected_height, detected_tz
+    return df, detected_height, detected_tz, detected_lat, detected_lon
 
 
 def guess_column(cols, keywords, default_idx=0):
@@ -439,6 +456,43 @@ def render_shear_fig(shear_data):
     return fig
 
 
+def render_long_term_fig(shear_data, model_height, model_label, lt_ws_at_model_height,
+                          interest_height, lt_ws_at_interest):
+    """Shows the fitted shear profile with the long-term corrected wind speed
+    highlighted at both the modelled dataset's height and the height of interest,
+    so the final number has a clear visual anchor rather than just a metric card."""
+    heights_used = shear_data["heights_used"]
+    mean_ws = shear_data["mean_ws"]
+    slope, intercept = shear_data["alpha"], shear_data["intercept"]
+
+    all_heights = heights_used + [model_height, interest_height]
+    z_min = max(1, min(all_heights) * 0.05)
+    z_max = max(all_heights) * 1.2
+    z_smooth = np.linspace(z_min, z_max, 200)
+    ws_ref = np.exp(intercept) * heights_used[0] ** slope
+    ws_smooth = ws_ref * (z_smooth / heights_used[0]) ** slope
+
+    fig, ax = plt.subplots(figsize=(5.6, 5.6))
+    ax.plot(ws_smooth, z_smooth, color="#2f9e44", linewidth=2, label="Fitted shear profile",
+            zorder=2)
+    ax.plot(mean_ws, heights_used, "D", color="navy", markersize=7,
+            label="Measured (period mean)", zorder=3)
+    ax.plot(lt_ws_at_model_height, model_height, "o", color="#888888", markersize=10,
+            label=f"Long-term at {model_label} height", zorder=4)
+    ax.plot(lt_ws_at_interest, interest_height, "*", color=FLAG, markersize=22,
+            label="Long-term at height of interest", zorder=5)
+    ax.annotate(f"{lt_ws_at_interest:.2f} m/s @ {interest_height:.0f} m",
+                xy=(lt_ws_at_interest, interest_height), xytext=(10, 8),
+                textcoords="offset points", fontsize=10, fontweight="bold", color=FLAG)
+    ax.set_xlabel("Wind Speed [m/s]")
+    ax.set_ylabel("Height [m]")
+    ax.set_title("Long-Term Wind Speed at Height of Interest")
+    ax.grid(True, alpha=0.4)
+    ax.legend(loc="upper left", frameon=False, fontsize=8)
+    fig.tight_layout()
+    return fig
+
+
 @st.cache_data(show_spinner="Matching measurement height to the modelled dataset...")
 def get_measurement_at_target_height(meas_series_by_height, shear_data, target_height, tolerance=2.0):
     for h, (series, _) in meas_series_by_height.items():
@@ -616,11 +670,11 @@ if meas_file is not None:
         is_vortex = sniff_vortex_format(model_bytes)
 
         if is_vortex:
-            raw_model_df, vortex_height, vortex_tz = parse_vortex_txt(model_bytes)
+            raw_model_df, vortex_height, vortex_tz, vortex_lat, vortex_lon = parse_vortex_txt(model_bytes)
             st.success(f"Detected a Vortex-format file - timestamp auto-combined from "
-                       f"YYYYMMDD + HHMM, Hub-Height={vortex_height:.0f} m and "
-                       f"Timezone=UTC{vortex_tz:+.1f} read from the file header "
-                       "(both editable below).")
+                       f"YYYYMMDD + HHMM, Hub-Height={vortex_height:.0f} m, "
+                       f"Timezone=UTC{vortex_tz:+.1f}, and coordinates read from the file "
+                       "header (all editable below).")
             st.write("Preview:")
             st.dataframe(raw_model_df.head(5), use_container_width=True)
 
@@ -656,6 +710,8 @@ if meas_file is not None:
                                              value="Vortex", key="model_label_vortex")
 
             model_tz_default = vortex_tz
+            model_lat_default = vortex_lat if vortex_lat is not None else 0.0
+            model_lon_default = vortex_lon if vortex_lon is not None else 0.0
         else:
             raw_model_df = read_raw_csv(model_bytes)
             st.write("Preview:")
@@ -689,6 +745,7 @@ if meas_file is not None:
                                              value="Modelled", key="model_label")
 
             model_tz_default = 0.0
+            model_lat_default, model_lon_default = 0.0, 0.0
 
         model_invalid_codes = parse_invalid_codes(model_invalid_text)
         model_df = build_clean_df(raw_model_df, model_ts_col, model_dayfirst,
@@ -709,6 +766,20 @@ if meas_file is not None:
                 "local time and this is pre-filled from the file header.",
                 value=model_tz_default, step=0.5, key="model_utc_offset")
 
+        st.subheader("2c. Location")
+        st.caption("Where the modelled wind dataset was extracted from" +
+                   (" - read from the Vortex file header." if is_vortex else
+                    " - enter the coordinates yourself, since this file format doesn't "
+                    "carry them."))
+        locc1, locc2 = st.columns(2)
+        with locc1:
+            model_lat = st.number_input("Latitude", min_value=-90.0, max_value=90.0,
+                                         value=model_lat_default, format="%.5f", key="model_lat")
+        with locc2:
+            model_lon = st.number_input("Longitude", min_value=-180.0, max_value=180.0,
+                                         value=model_lon_default, format="%.5f", key="model_lon")
+        st.map(pd.DataFrame({"lat": [model_lat], "lon": [model_lon]}), zoom=5, size=200)
+
         meas_df_utc = meas_df.copy()
         meas_df_utc.index = meas_df_utc.index - pd.Timedelta(hours=utc_offset)
 
@@ -723,8 +794,14 @@ if meas_file is not None:
         st.divider()
         st.header("3. Analysis settings")
         st.caption("These settings feed the Shear, Correlation and Long-Term tabs below.")
-        min_avail = st.slider("Minimum data availability to include a height in the "
-                               "shear fit (%)", 0, 100, 80)
+        s1, s2 = st.columns(2)
+        with s1:
+            min_avail = st.slider("Minimum data availability to include a height in the "
+                                   "shear fit (%)", 0, 100, 80)
+        with s2:
+            interest_height = st.number_input(
+                "Height of interest for the long-term result (m)", min_value=1.0,
+                value=float(sorted_heights(height_map)[0]["height"]))
 
         shear_data = compute_shear_data(meas_df, height_map, min_availability=min_avail)
         if shear_data is not None:
@@ -734,6 +811,23 @@ if meas_file is not None:
             st.warning("Fewer than 3 heights meet the availability threshold - shear-dependent "
                        "results (extrapolation, long-term at non-matching heights) won't be "
                        "available until this is resolved.")
+
+        # Long-term correction computed once here, shared by the Long-Term tab and the
+        # "download all plots" package below, rather than recomputed in each place.
+        lt = None
+        lt_desc = None
+        lt_ws_at_model_height = None
+        lt_ws_at_interest = None
+        if shear_data is not None:
+            lt_target_series, lt_desc, lt_ref_h = get_measurement_at_target_height(
+                meas_series_by_height, shear_data, model_height)
+            if lt_target_series is not None:
+                lt_merged = merge_concurrent(lt_target_series, model_df_utc[model_ws_col])
+                if len(lt_merged) >= 2:
+                    lt = long_term_correction(lt_merged, model_df_utc[model_ws_col])
+                    lt_ws_at_model_height = lt["tls"]["lt_mean"]
+                    lt_ws_at_interest = (lt_ws_at_model_height *
+                                          (interest_height / model_height) ** shear_data["alpha"])
 
         st.divider()
         st.header("4. Results")
@@ -856,52 +950,134 @@ if meas_file is not None:
         # ---- Long-term result ----
         with tabs[5]:
             st.subheader("Long-term wind speed at your height of interest")
-            interest_height = st.number_input("Height of interest (m)", min_value=1.0,
-                                               value=float(sorted_heights(height_map)[0]["height"]))
 
-            target_series, desc, ref_h = get_measurement_at_target_height(
-                meas_series_by_height, shear_data, model_height)
-
-            if target_series is None:
-                st.warning(f"Cannot build a series at {model_height:.0f} m: {desc}.")
-            elif shear_data is None:
+            if shear_data is None:
                 st.warning("Shear exponent could not be computed (need >=3 heights at the "
                            "chosen availability threshold) - cannot extrapolate to the "
                            "height of interest.")
+            elif lt is None:
+                st.warning(f"Cannot build a series at {model_height:.0f} m ({lt_desc}), or "
+                           "there's no concurrent overlap with the modelled dataset.")
             else:
-                merged_lt = merge_concurrent(target_series, model_df_utc[model_ws_col])
+                alpha = shear_data["alpha"]
+                st.write(f"Correlation basis: measurement at {model_height:.0f} m ({lt_desc}).")
+                st.write(f"Concurrent period: {lt['n_concurrent']} hours "
+                         f"(concurrent mean measured = {lt['concurrent_meas_mean']:.3f} m/s, "
+                         f"concurrent mean {model_label} = {lt['concurrent_model_mean']:.3f} m/s)")
+                st.write(f"Full {model_label} record: {lt['lt_model_start'].date()} to "
+                         f"{lt['lt_model_end'].date()}, long-term mean {model_label} = "
+                         f"{lt['lt_model_mean']:.3f} m/s")
 
-                if len(merged_lt) < 2:
-                    st.warning("No concurrent overlap - cannot run the long-term correction.")
-                else:
-                    lt = long_term_correction(merged_lt, model_df_utc[model_ws_col])
-                    alpha = shear_data["alpha"]
+                m1, m2 = st.columns(2)
+                with m1:
+                    st.metric(f"Long-term wind speed at {model_height:.0f} m "
+                              f"({model_label} height)",
+                              f"{lt_ws_at_model_height:.3f} m/s")
+                with m2:
+                    st.metric(f"Long-term wind speed at {interest_height:.0f} m "
+                              f"(shear-extrapolated, alpha={alpha:.3f})",
+                              f"{lt_ws_at_interest:.3f} m/s")
 
-                    lt_ws_at_model_height = lt["tls"]["lt_mean"]
-                    lt_ws_at_interest = lt_ws_at_model_height * (interest_height / model_height) ** alpha
+                fig = render_long_term_fig(shear_data, model_height, model_label,
+                                            lt_ws_at_model_height, interest_height,
+                                            lt_ws_at_interest)
+                show_fig(fig, width=WIDTH_SHEAR + 100)
 
-                    st.write(f"Correlation basis: measurement at {model_height:.0f} m ({desc}).")
-                    st.write(f"Concurrent period: {lt['n_concurrent']} hours "
-                             f"(concurrent mean measured = {lt['concurrent_meas_mean']:.3f} m/s, "
-                             f"concurrent mean {model_label} = {lt['concurrent_model_mean']:.3f} m/s)")
-                    st.write(f"Full {model_label} record: {lt['lt_model_start'].date()} to "
-                             f"{lt['lt_model_end'].date()}, long-term mean {model_label} = "
-                             f"{lt['lt_model_mean']:.3f} m/s")
+                st.caption(f"For reference, OLS fit gives a long-term mean of "
+                           f"{lt['ols']['lt_mean']:.3f} m/s at {model_height:.0f} m. "
+                           "The orthogonal (TLS) result above is used as the primary "
+                           "estimate since OLS understates slope when both series carry "
+                           "noise.")
 
-                    m1, m2 = st.columns(2)
-                    with m1:
-                        st.metric(f"Long-term wind speed at {model_height:.0f} m "
-                                  f"({model_label} height)",
-                                  f"{lt_ws_at_model_height:.3f} m/s")
-                    with m2:
-                        st.metric(f"Long-term wind speed at {interest_height:.0f} m "
-                                  f"(shear-extrapolated, alpha={alpha:.3f})",
-                                  f"{lt_ws_at_interest:.3f} m/s")
+        st.divider()
+        st.header("5. Download")
+        st.caption("Bundles every chart above into a single ZIP, generated at the settings "
+                   "currently selected (availability threshold, heights, etc).")
+        if st.button("Prepare all plots for download"):
+            with st.spinner("Rendering all plots..."):
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    # 1. Data availability
+                    table = availability_table(meas_df, height_map)
+                    zf.writestr("01_data_availability.png",
+                                fig_to_png_bytes(plot_availability_bars(table, threshold=min_avail)))
+                    zf.writestr("01_data_availability.csv", table.to_csv())
 
-                    st.caption(f"For reference, OLS fit gives a long-term mean of "
-                               f"{lt['ols']['lt_mean']:.3f} m/s at {model_height:.0f} m. "
-                               "The orthogonal (TLS) result above is used as the primary "
-                               "estimate since OLS understates slope when both series carry "
-                               "noise.")
+                    # 2. Monthly means - one per mapped height
+                    for hm in sorted_heights(height_map):
+                        mm, inc, om = monthly_mean_data(meas_df, hm["ws_col"],
+                                                         samples_per_day=samples_per_day)
+                        fig = render_monthly_fig(mm, inc, om, f"{hm['height']:.0f} m")
+                        zf.writestr(f"02_monthly_mean_{hm['height']:.0f}m.png",
+                                    fig_to_png_bytes(fig))
+
+                    # 3. Wind rose (first height with a direction column mapped, if any)
+                    rose_heights = [hm for hm in sorted_heights(height_map)
+                                    if hm["wd_col"] is not None]
+                    if rose_heights and model_wd_col is not None:
+                        hm_r = rose_heights[0]
+                        combined = rose_source_data(
+                            meas_df_utc[hm_r["ws_col"]], meas_df_utc[hm_r["wd_col"]],
+                            model_df_utc[model_ws_col], model_df_utc[model_wd_col],
+                            samples_per_hour)
+                        fig = render_rose_fig(combined, f"{hm_r['height']:.0f} m",
+                                               f"{model_label} ({model_height:.0f} m)")
+                        if fig is not None:
+                            zf.writestr("03_wind_rose_comparison.png", fig_to_png_bytes(fig))
+
+                    # 4. Shear profile
+                    if shear_data is not None:
+                        zf.writestr("04_shear_profile.png",
+                                    fig_to_png_bytes(render_shear_fig(shear_data)))
+
+                    # 5. Correlation - hourly / daily / monthly
+                    if shear_data is not None:
+                        corr_series, corr_desc, _ = get_measurement_at_target_height(
+                            meas_series_by_height, shear_data, model_height)
+                        if corr_series is not None:
+                            corr_merged = merge_concurrent(corr_series, model_df_utc[model_ws_col])
+                            if len(corr_merged) >= 2:
+                                daily_avg, monthly_avg = build_daily_monthly(corr_merged)
+                                for label, data, fname in [
+                                        ("Hourly", corr_merged, "05_correlation_hourly.png"),
+                                        ("Daily Average", daily_avg, "06_correlation_daily.png"),
+                                        ("Monthly Average", monthly_avg, "07_correlation_monthly.png")]:
+                                    fig, _ = correlation_fig(data, label, model_label)
+                                    if fig is not None:
+                                        zf.writestr(fname, fig_to_png_bytes(fig))
+
+                    # 6. Long-term wind speed at height of interest
+                    if lt is not None:
+                        fig = render_long_term_fig(shear_data, model_height, model_label,
+                                                    lt_ws_at_model_height, interest_height,
+                                                    lt_ws_at_interest)
+                        zf.writestr("08_long_term_wind_speed.png", fig_to_png_bytes(fig))
+
+                        summary = (
+                            f"Wind Resource Analysis - Summary\n"
+                            f"=================================\n"
+                            f"Shear exponent (alpha): {shear_data['alpha']:.3f}\n"
+                            f"Heights used in shear fit: {shear_data['heights_used']}\n\n"
+                            f"Modelled dataset: {model_label} at {model_height:.0f} m\n"
+                            f"Correlation basis: {corr_desc if shear_data is not None else 'n/a'}\n"
+                            f"Concurrent hours: {lt['n_concurrent']}\n"
+                            f"Long-term mean at {model_height:.0f} m (TLS): "
+                            f"{lt_ws_at_model_height:.3f} m/s\n"
+                            f"Long-term mean at {interest_height:.0f} m (shear-extrapolated): "
+                            f"{lt_ws_at_interest:.3f} m/s\n"
+                            f"Long-term mean at {model_height:.0f} m (OLS, reference only): "
+                            f"{lt['ols']['lt_mean']:.3f} m/s\n"
+                        )
+                        zf.writestr("00_summary.txt", summary)
+
+                buf.seek(0)
+                st.session_state["plots_zip"] = buf.read()
+
+        if "plots_zip" in st.session_state:
+            st.download_button(
+                "Download all plots (ZIP)", st.session_state["plots_zip"],
+                file_name="wind_analysis_plots.zip", mime="application/zip")
+            st.caption("Reflects the settings selected at the moment you clicked "
+                       "'Prepare' - click it again after changing anything above.")
 else:
     st.info("Upload a measurement CSV to begin.")
