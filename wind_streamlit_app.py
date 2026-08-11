@@ -342,13 +342,26 @@ def circular_mean_deg(directions):
     return (np.rad2deg(np.arctan2(np.sin(rad).mean(), np.cos(rad).mean()))) % 360
 
 
+@st.cache_data(show_spinner="Resampling direction data to hourly...")
+def resample_wd_to_hourly(wd, samples_per_hour, min_fraction=0.5):
+    """Same completeness-threshold logic as resample_to_hourly, but using a
+    circular mean since wind direction wraps at 360 degrees."""
+    hourly_wd = wd.resample("h").apply(circular_mean_deg)
+    hourly_count = wd.resample("h").count()
+    hourly_wd[hourly_count < samples_per_hour * min_fraction] = np.nan
+    return hourly_wd
+
+
 @st.cache_data(show_spinner="Resampling wind rose data to hourly and matching concurrent hours...")
-def rose_source_data(meas_ws, meas_wd, model_ws, model_wd, samples_per_hour):
+def rose_source_data(meas_ws, meas_wd, model_ws_hourly, model_wd_hourly, samples_per_hour):
+    """model_ws_hourly / model_wd_hourly are expected to already be at hourly
+    resolution (resampled upstream using the modelled dataset's OWN detected
+    resolution) - only the measurement side is resampled here."""
     meas_ws_hourly = resample_to_hourly(meas_ws, samples_per_hour)
-    meas_wd_hourly = meas_wd.resample("h").apply(circular_mean_deg)
+    meas_wd_hourly = resample_wd_to_hourly(meas_wd, samples_per_hour)
     combined = pd.concat(
         [meas_ws_hourly.rename("meas_ws"), meas_wd_hourly.rename("meas_wd"),
-         model_ws.rename("model_ws"), model_wd.rename("model_wd")],
+         model_ws_hourly.rename("model_ws"), model_wd_hourly.rename("model_wd")],
         axis=1, join="inner"
     ).dropna()
     return combined
@@ -786,6 +799,19 @@ if meas_file is not None:
         model_df_utc = model_df.copy()
         model_df_utc.index = model_df_utc.index - pd.Timedelta(hours=model_utc_offset)
 
+        model_res_minutes = detect_resolution_minutes(model_df.index)
+        model_samples_per_hour = max(1, round(60 / model_res_minutes))
+        if model_res_minutes < 55:
+            st.info(f"Detected modelled dataset resolution: ~{model_res_minutes:.1f} min "
+                    f"({model_samples_per_hour} samples/hour) - averaging to hourly before "
+                    "correlation, same as the measurement data.")
+        # Averaging to hourly here (rather than joining raw) matters whenever the modelled
+        # dataset isn't already hourly: an inner join on raw sub-hourly data would only catch
+        # the on-the-hour instant and silently drop the rest, instead of a proper hourly mean.
+        model_ws_hourly = resample_to_hourly(model_df_utc[model_ws_col], model_samples_per_hour)
+        model_wd_hourly = (resample_wd_to_hourly(model_df_utc[model_wd_col], model_samples_per_hour)
+                            if model_wd_col is not None else None)
+
         meas_series_by_height = {}
         for hm in sorted_heights(height_map):
             hourly = resample_to_hourly(meas_df_utc[hm["ws_col"]], samples_per_hour)
@@ -822,9 +848,9 @@ if meas_file is not None:
             lt_target_series, lt_desc, lt_ref_h = get_measurement_at_target_height(
                 meas_series_by_height, shear_data, model_height)
             if lt_target_series is not None:
-                lt_merged = merge_concurrent(lt_target_series, model_df_utc[model_ws_col])
+                lt_merged = merge_concurrent(lt_target_series, model_ws_hourly)
                 if len(lt_merged) >= 2:
-                    lt = long_term_correction(lt_merged, model_df_utc[model_ws_col])
+                    lt = long_term_correction(lt_merged, model_ws_hourly)
                     lt_ws_at_model_height = lt["tls"]["lt_mean"]
                     lt_ws_at_interest = (lt_ws_at_model_height *
                                           (interest_height / model_height) ** shear_data["alpha"])
@@ -878,7 +904,7 @@ if meas_file is not None:
 
                 combined = rose_source_data(
                     meas_df_utc[hm_r["ws_col"]], meas_df_utc[hm_r["wd_col"]],
-                    model_df_utc[model_ws_col], model_df_utc[model_wd_col], samples_per_hour)
+                    model_ws_hourly, model_wd_hourly, samples_per_hour)
                 fig = render_rose_fig(combined, rose_height_label,
                                        f"{model_label} ({model_height:.0f} m)")
 
@@ -925,7 +951,7 @@ if meas_file is not None:
             else:
                 st.info(f"Using measurement at {model_height:.0f} m ({desc}).")
 
-                merged_hourly = merge_concurrent(target_series, model_df_utc[model_ws_col])
+                merged_hourly = merge_concurrent(target_series, model_ws_hourly)
                 daily_avg, monthly_avg = build_daily_monthly(merged_hourly) \
                     if len(merged_hourly) >= 2 else (pd.DataFrame(), pd.DataFrame())
 
@@ -1018,7 +1044,7 @@ if meas_file is not None:
                         hm_r = rose_heights[0]
                         combined = rose_source_data(
                             meas_df_utc[hm_r["ws_col"]], meas_df_utc[hm_r["wd_col"]],
-                            model_df_utc[model_ws_col], model_df_utc[model_wd_col],
+                            model_ws_hourly, model_wd_hourly,
                             samples_per_hour)
                         fig = render_rose_fig(combined, f"{hm_r['height']:.0f} m",
                                                f"{model_label} ({model_height:.0f} m)")
@@ -1035,7 +1061,7 @@ if meas_file is not None:
                         corr_series, corr_desc, _ = get_measurement_at_target_height(
                             meas_series_by_height, shear_data, model_height)
                         if corr_series is not None:
-                            corr_merged = merge_concurrent(corr_series, model_df_utc[model_ws_col])
+                            corr_merged = merge_concurrent(corr_series, model_ws_hourly)
                             if len(corr_merged) >= 2:
                                 daily_avg, monthly_avg = build_daily_monthly(corr_merged)
                                 for label, data, fname in [
