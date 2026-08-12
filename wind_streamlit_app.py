@@ -180,10 +180,15 @@ def build_clean_df(raw_df, ts_col, dayfirst, invalid_codes):
     df = raw_df.copy()
     df[ts_col] = pd.to_datetime(df[ts_col], dayfirst=dayfirst, errors="coerce")
     df = df.dropna(subset=[ts_col]).set_index(ts_col).sort_index()
-    if invalid_codes:
-        df = df.replace(invalid_codes, np.nan)
+    # Numeric conversion MUST happen before the invalid-code replace: if a column has
+    # any stray non-numeric text in it (even just a whitespace-only cell), pandas keeps
+    # that whole column as text, and a text "9999" won't match a float invalid code of
+    # 9999.0 - so codes would silently slip through uncaught. Converting first guarantees
+    # every column is numeric before we try to match codes against it.
     for c in df.columns:
         df[c] = pd.to_numeric(df[c], errors="coerce")
+    if invalid_codes:
+        df = df.replace(invalid_codes, np.nan)
     return df
 
 
