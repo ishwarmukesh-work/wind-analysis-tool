@@ -27,7 +27,7 @@ st.set_page_config(page_title="Wind Resource Analysis", layout="wide")
 
 st.sidebar.title("Wind Analysis Toolkit")
 mode = st.sidebar.radio(
-    "Choose tool",
+    "Choose Tool",
     ["Long-Term Correction", "Measurement Campaign Planning"],
     help="Long-Term Correction: measurement + modelled data correlation and long-term "
          "wind speed. Measurement Campaign Planning: preliminary wind look-up and "
