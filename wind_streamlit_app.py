@@ -817,6 +817,19 @@ def build_planning_map_fig(active_map, boundary_gdf, layout_gdf, show_layout_ws,
         yaxis=dict(scaleanchor="x", scaleratio=1),
         dragmode="pan",
     )
+
+    if boundary_gdf is not None:
+        bx0, by0, bx1, by1 = boundary_gdf.total_bounds
+        pad_x = (bx1 - bx0) * 0.20 or 0.01
+        pad_y = (by1 - by0) * 0.20 or 0.01
+        fig.update_xaxes(range=[bx0 - pad_x, bx1 + pad_x])
+        fig.update_yaxes(range=[by0 - pad_y, by1 + pad_y])
+        # uirevision keyed on the boundary itself: as long as the boundary hasn't
+        # changed, Plotly preserves whatever pan/zoom the user has set instead of
+        # resetting to the default range above on every rerun (e.g. clicking "Fix
+        # points" or "Locate best points" would otherwise zoom back out every time).
+        fig.update_layout(uirevision=boundary_gdf.geometry.iloc[0].wkt)
+
     return fig, (len(fig.data) - 1 if click_grid is not None else None)
 
 
@@ -897,6 +910,131 @@ def render_comparison_fig(combo_labels, points, wind_maps):
     ax.legend(fontsize=8, frameon=False)
     fig.tight_layout()
     return fig
+
+
+def render_full_campaign_map_fig(active_map, boundary_gdf, layout_gdf, measurement_points,
+                                  best_points):
+    """A single static overview combining every layer: background wind map with its
+    colour scale, site boundary, layout with per-turbine wind speed labels, the
+    candidate measurement points, and the K-Means-recommended best points -
+    intended as the one "everything" figure for the download package."""
+    from matplotlib.lines import Line2D
+    import matplotlib.patheffects as pe
+
+    outline = [pe.withStroke(linewidth=2.5, foreground="black")]
+    outline_w = [pe.withStroke(linewidth=2.5, foreground="white")]
+
+    fig, ax = plt.subplots(figsize=(11, 9))
+
+    if active_map is not None:
+        data, meta = active_map
+        im = ax.imshow(data, extent=meta["extent"], origin="upper", cmap="viridis",
+                        aspect="auto")
+        cbar = fig.colorbar(im, ax=ax, fraction=0.045, pad=0.02)
+        cbar.set_label("Wind Speed (m/s)")
+
+    if boundary_gdf is not None:
+        boundary_gdf.plot(ax=ax, facecolor="none", edgecolor="black", linewidth=2)
+
+    handles = []
+    if layout_gdf is not None:
+        lx = [g.x for g in layout_gdf.geometry]
+        ly = [g.y for g in layout_gdf.geometry]
+        ax.scatter(lx, ly, facecolor="none", edgecolor="white", marker="o", s=45,
+                   linewidth=1.3, zorder=4, path_effects=outline)
+        if active_map is not None:
+            data, meta = active_map
+            for x, y in zip(lx, ly):
+                ws = sample_raster(data, meta, y, x)
+                if not np.isnan(ws):
+                    txt = ax.annotate(f"{ws:.2f}", (x, y), color="yellow", fontsize=7,
+                                       xytext=(3, 3), textcoords="offset points", zorder=5)
+                    txt.set_path_effects(outline)
+        handles.append(Line2D([0], [0], marker="o", color="none", markeredgecolor="white",
+                               label="Layout turbine", markersize=8))
+
+    if measurement_points:
+        labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+        for i, (lat, lon) in enumerate(measurement_points):
+            ax.plot(lon, lat, "o", color="red", markersize=9, zorder=6,
+                    path_effects=outline_w)
+            txt = ax.annotate(labels[i], (lon, lat), color="white", fontsize=10,
+                               fontweight="bold", xytext=(4, 4), textcoords="offset points",
+                               zorder=7)
+            txt.set_path_effects(outline)
+        handles.append(Line2D([0], [0], marker="o", color="red", linestyle="",
+                               label="Measurement point", markersize=8))
+
+    if best_points:
+        for lat, lon, info in best_points:
+            ax.plot(lon, lat, "*", color="orange", markersize=18,
+                    markeredgecolor="black", zorder=6, path_effects=outline_w)
+            txt = ax.annotate(f"P{info['cluster']}", (lon, lat), color="black", fontsize=10,
+                               fontweight="bold", xytext=(6, -10), textcoords="offset points",
+                               zorder=7)
+            txt.set_path_effects(outline_w)
+        handles.append(Line2D([0], [0], marker="*", color="orange", markeredgecolor="black",
+                               linestyle="", label="Best measurement point", markersize=13))
+
+    if handles:
+        ax.legend(handles=handles, loc="upper right", framealpha=0.9, fontsize=9)
+
+    if boundary_gdf is not None:
+        bx0, by0, bx1, by1 = boundary_gdf.total_bounds
+        pad_x = (bx1 - bx0) * 0.20 or 0.01
+        pad_y = (by1 - by0) * 0.20 or 0.01
+        ax.set_xlim(bx0 - pad_x, bx1 + pad_x)
+        ax.set_ylim(by0 - pad_y, by1 + pad_y)
+
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title("Measurement Campaign Planning - Overview")
+    fig.tight_layout()
+    return fig
+
+
+def build_campaign_excel(boundary_gdf, layout_gdf, wind_maps, measurement_points, best_points):
+    """One workbook: site boundary vertices, layout, layout wind speed (one column
+    per loaded wind map), candidate measurement points, and best measurement points."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        if boundary_gdf is not None:
+            bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
+            pd.DataFrame({"Latitude": list(by), "Longitude": list(bx)}).to_excel(
+                writer, sheet_name="Site Boundary", index=False)
+
+        if layout_gdf is not None:
+            lat = [g.y for g in layout_gdf.geometry]
+            lon = [g.x for g in layout_gdf.geometry]
+            layout_df = pd.DataFrame({"Turbine": [f"T{i+1}" for i in range(len(lat))],
+                                       "Latitude": lat, "Longitude": lon})
+            layout_df.to_excel(writer, sheet_name="Layout", index=False)
+
+            ws_df = layout_df.copy()
+            for (source, height), (data, meta) in wind_maps.items():
+                col = f"{source} @ {height}m (m/s)"
+                ws_df[col] = [sample_raster(data, meta, la, lo) for la, lo in zip(lat, lon)]
+            ws_df.to_excel(writer, sheet_name="Layout Wind Speeds", index=False)
+
+        if measurement_points:
+            labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            mp_df = pd.DataFrame([
+                {"Label": labels[i], "Latitude": lat, "Longitude": lon}
+                for i, (lat, lon) in enumerate(measurement_points)
+            ])
+            mp_df.to_excel(writer, sheet_name="Measurement Points", index=False)
+
+        if best_points:
+            bp_df = pd.DataFrame([
+                {"Point": f"P{info['cluster']}", "Latitude": lat, "Longitude": lon,
+                 "Wind Speed (m/s)": info["ws"], "Mean Deviation (%)": info["mean_dev"],
+                 "Max Deviation (%)": info["max_dev"]}
+                for lat, lon, info in best_points
+            ])
+            bp_df.to_excel(writer, sheet_name="Best Measurement Points", index=False)
+
+    buf.seek(0)
+    return buf.read()
 
 
 if mode == "Long-Term Correction":
@@ -1415,7 +1553,7 @@ elif mode == "Measurement Campaign Planning":
         except Exception as e:
             st.error(f"Could not read boundary file: {e}")
     if st.session_state.camp_boundary is not None:
-        st.success(f"Boundary loaded ({len(st.session_state.camp_boundary)} feature(s)).")
+        st.success("Boundary loaded.")
 
     st.divider()
 
@@ -1423,6 +1561,9 @@ elif mode == "Measurement Campaign Planning":
     st.header("2. Wind maps (modelled data)")
     st.caption("Upload one or more ESRI ASCII grid (.asc) wind speed maps - e.g. Vortex map "
                "exports - each tagged with a source and height.")
+    if "camp_wm_uploader_key" not in st.session_state:
+        st.session_state.camp_wm_uploader_key = 0
+
     wc1, wc2, wc3 = st.columns([1, 1, 2])
     with wc1:
         wm_source = st.text_input("Source label", value="ERA5", key="camp_wm_source")
@@ -1430,7 +1571,9 @@ elif mode == "Measurement Campaign Planning":
         wm_height = st.number_input("Height (m)", min_value=1.0, value=100.0, step=1.0,
                                      key="camp_wm_height")
     with wc3:
-        wm_file = st.file_uploader("Wind map (.asc)", type=["asc"], key="camp_wm_file")
+        wm_file = st.file_uploader(
+            "Wind map (.asc)", type=["asc"],
+            key=f"camp_wm_file_{st.session_state.camp_wm_uploader_key}")
 
     if st.button("Add wind map"):
         if wm_file is None:
@@ -1444,13 +1587,22 @@ elif mode == "Measurement Campaign Planning":
                     data, meta = read_ascii_grid(wm_file.getvalue())
                     st.session_state.camp_wind_maps[wm_key] = (data, meta)
                     st.session_state.camp_active_map = wm_key
+                    # Bump the uploader's key so it resets to empty instead of
+                    # continuing to show the just-added file.
+                    st.session_state.camp_wm_uploader_key += 1
                     st.success(f"Added {wm_source} @ {wm_height:.0f} m")
+                    st.rerun()
                 except Exception as e:
                     st.error(f"Could not read wind map: {e}")
 
     if st.session_state.camp_wind_maps:
         map_keys = list(st.session_state.camp_wind_maps.keys())
         map_labels = [f"{s} @ {h} m" for s, h in map_keys]
+
+        st.write(f"**Loaded wind maps ({len(map_keys)}):**")
+        loaded_df = pd.DataFrame([{"Source": s, "Height (m)": h} for s, h in map_keys])
+        st.dataframe(loaded_df, hide_index=True, width="stretch")
+
         default_idx = (map_keys.index(st.session_state.camp_active_map)
                        if st.session_state.camp_active_map in map_keys else 0)
         mapc1, mapc2 = st.columns([3, 1])
@@ -1583,6 +1735,9 @@ elif mode == "Measurement Campaign Planning":
 
     # ------------------------------------------------------------------ STEP 5 --
     st.header("5. Compare wind speed at chosen points")
+    if "camp_comparison_combos" not in st.session_state:
+        st.session_state.camp_comparison_combos = []
+
     if not st.session_state.camp_points:
         st.info("Place at least one measurement point on the map above.")
     elif not st.session_state.camp_wind_maps:
@@ -1594,6 +1749,7 @@ elif mode == "Measurement Campaign Planning":
             labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             points = {labels[i]: pt for i, pt in enumerate(st.session_state.camp_points)}
             combos = [c.strip() for c in combo_text.split(";") if c.strip()]
+            valid_combos = []
             if not combos:
                 st.error("Enter at least one combination.")
             for combo in combos:
@@ -1602,6 +1758,19 @@ elif mode == "Measurement Campaign Planning":
                 if missing:
                     st.error(f"Unknown point label(s) in '{combo}': {missing}")
                     continue
+                valid_combos.append(combo)
+            st.session_state.camp_comparison_combos = valid_combos
+
+        # Rendered unconditionally from session_state (not gated behind the button
+        # above) so these stay visible across reruns triggered by other buttons,
+        # e.g. "Locate best measurement points" below.
+        if st.session_state.camp_comparison_combos:
+            labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+            points = {labels[i]: pt for i, pt in enumerate(st.session_state.camp_points)}
+            for combo in st.session_state.camp_comparison_combos:
+                combo_labels = [c.strip() for c in combo.split(",")]
+                if any(l not in points for l in combo_labels):
+                    continue  # points changed since this combo was generated
                 fig = render_comparison_fig(combo_labels, points, st.session_state.camp_wind_maps)
                 show_fig(fig, width="stretch")
 
@@ -1646,6 +1815,51 @@ elif mode == "Measurement Campaign Planning":
             st.download_button("Download best points (CSV)",
                                 bp_df.to_csv(index=False).encode("utf-8"),
                                 file_name="best_measurement_points.csv", mime="text/csv")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 7 --
+    st.header("7. Download all statistics")
+    st.caption("Bundles the comparison plots, an Excel workbook (site boundary, layout, "
+               "layout wind speeds, and best measurement points), and one combined overview "
+               "figure into a single ZIP.")
+    if st.button("Prepare all statistics for download"):
+        with st.spinner("Building download package..."):
+            buf = io.BytesIO()
+            with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                points = {labels[i]: pt for i, pt in enumerate(st.session_state.camp_points)}
+                for combo in st.session_state.camp_comparison_combos:
+                    combo_labels = [c.strip() for c in combo.split(",")]
+                    if any(l not in points for l in combo_labels):
+                        continue
+                    fig = render_comparison_fig(combo_labels, points,
+                                                 st.session_state.camp_wind_maps)
+                    fname = f"comparison_{'_'.join(combo_labels)}.png"
+                    zf.writestr(fname, fig_to_png_bytes(fig))
+
+                excel_bytes = build_campaign_excel(
+                    st.session_state.camp_boundary, st.session_state.camp_layout,
+                    st.session_state.camp_wind_maps, st.session_state.camp_points,
+                    st.session_state.camp_best_points)
+                zf.writestr("campaign_data.xlsx", excel_bytes)
+
+                active = (st.session_state.camp_wind_maps.get(st.session_state.camp_active_map)
+                          if st.session_state.camp_active_map else None)
+                overview_fig = render_full_campaign_map_fig(
+                    active, st.session_state.camp_boundary, st.session_state.camp_layout,
+                    st.session_state.camp_points, st.session_state.camp_best_points)
+                zf.writestr("campaign_overview.png", fig_to_png_bytes(overview_fig))
+
+            buf.seek(0)
+            st.session_state["camp_zip"] = buf.read()
+
+    if "camp_zip" in st.session_state:
+        st.download_button("Download all statistics (ZIP)", st.session_state["camp_zip"],
+                            file_name="measurement_campaign_planning.zip",
+                            mime="application/zip")
+        st.caption("Reflects the settings selected at the moment you clicked 'Prepare' - "
+                   "click it again after changing anything above.")
 
     st.divider()
     if st.button("Reset planning tool"):
