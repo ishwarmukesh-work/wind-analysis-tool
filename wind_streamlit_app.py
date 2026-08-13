@@ -27,11 +27,14 @@ st.set_page_config(page_title="Wind Resource Analysis", layout="wide")
 
 st.sidebar.title("Wind Analysis Toolkit")
 mode = st.sidebar.radio(
-    "Choose Tool",
-    ["Long-Term Correction", "Measurement Campaign Planning"],
+    "Choose tool",
+    ["Long-Term Correction", "Measurement Campaign Planning",
+     "Preliminary Wind Resource Assessment"],
     help="Long-Term Correction: measurement + modelled data correlation and long-term "
          "wind speed. Measurement Campaign Planning: preliminary wind look-up and "
-         "LiDAR/FLiDAR siting from modelled maps, a , and a turbine layout.")
+         "LiDAR/FLiDAR siting from modelled maps, a site boundary, and a turbine layout. "
+         "Preliminary Wind Resource Assessment: multi-source (ERA5/CFSR) shear, hub-height "
+         "extrapolation, weighting, and long-term calibration across a turbine layout.")
 st.sidebar.divider()
 
 plt.rcParams.update({
@@ -915,7 +918,7 @@ def render_comparison_fig(combo_labels, points, wind_maps):
 def render_full_campaign_map_fig(active_map, boundary_gdf, layout_gdf, measurement_points,
                                   best_points):
     """A single static overview combining every layer: background wind map with its
-    colour scale, , layout with per-turbine wind speed labels, the
+    colour scale, site boundary, layout with per-turbine wind speed labels, the
     candidate measurement points, and the K-Means-recommended best points -
     intended as the one "everything" figure for the download package."""
     from matplotlib.lines import Line2D
@@ -994,14 +997,14 @@ def render_full_campaign_map_fig(active_map, boundary_gdf, layout_gdf, measureme
 
 
 def build_campaign_excel(boundary_gdf, layout_gdf, wind_maps, measurement_points, best_points):
-    """One workbook:  vertices, layout, layout wind speed (one column
+    """One workbook: site boundary vertices, layout, layout wind speed (one column
     per loaded wind map), candidate measurement points, and best measurement points."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         if boundary_gdf is not None:
             bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
             pd.DataFrame({"Latitude": list(by), "Longitude": list(bx)}).to_excel(
-                writer, sheet_name="", index=False)
+                writer, sheet_name="Site Boundary", index=False)
 
         if layout_gdf is not None:
             lat = [g.y for g in layout_gdf.geometry]
@@ -1037,13 +1040,337 @@ def build_campaign_excel(boundary_gdf, layout_gdf, wind_maps, measurement_points
     return buf.read()
 
 
+# ==============================================================================
+# PRELIMINARY WIND RESOURCE ASSESSMENT - HELPERS
+# (reuses read_ascii_grid, sample_raster, read_geo_file_from_bytes, read_layout_file,
+# boundary_path, show_fig, fig_to_png_bytes from the Measurement Campaign Planning
+# section above)
+# ==============================================================================
+
+def detect_asc_height(filename):
+    """Height in meters from a .asc filename. Primary pattern matches the
+    '.M.<N>m' convention (e.g. 'site.M.100m.asc'); falls back to any trailing
+    number-then-m pattern if that's not found."""
+    m = re.search(r"\.M\.(\d+)m", filename, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    m = re.search(r"(\d+)\s*m(?:\.asc)?$", filename, flags=re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+    return None
+
+
+@st.cache_data(show_spinner=False)
+def cached_read_ascii_grid(file_bytes):
+    """A folder can easily hold a dozen+ .asc files across both sources -
+    without caching, every one would be fully re-parsed on every rerun
+    (e.g. every keystroke elsewhere on the page)."""
+    return read_ascii_grid(file_bytes)
+
+
+def compute_shear_at_point(wind_maps_source, lat, lon):
+    """wind_maps_source: {height: (data, meta)} for ONE source (ERA5 or CFSR).
+    Fits ln(z) vs ln(WS) across every available valid height AT THIS EXACT
+    LOCATION - one regression per position, rather than pooling every
+    consecutive-height-pair alpha from every position into one site-wide
+    number. The same code path naturally handles 2 heights (a direct slope)
+    or 3+ (a proper least-squares fit). Returns (alpha, r2, n_heights_used)."""
+    heights = sorted(wind_maps_source.keys())
+    zs, ws = [], []
+    for h in heights:
+        data, meta = wind_maps_source[h]
+        val = sample_raster(data, meta, lat, lon)
+        if not np.isnan(val) and val > 0:
+            zs.append(h)
+            ws.append(val)
+    if len(zs) < 2:
+        return np.nan, np.nan, len(zs)
+    slope, intercept, r, p, se = stats.linregress(np.log(zs), np.log(ws))
+    return slope, r ** 2, len(zs)
+
+
+def sample_at_height(wind_maps_source, lat, lon, target_height, alpha):
+    """Extrapolates to target_height from the nearest available height at or
+    below it (or the minimum available height if none are below), using the
+    given location-specific shear exponent. Used consistently everywhere a
+    height needs picking - unlike the original tool, which used this "nearest
+    available" logic in one place but silently hardcoded height 100 elsewhere,
+    breaking for any map set that didn't happen to include a 100m file."""
+    heights = sorted(wind_maps_source.keys())
+    if not heights or np.isnan(alpha):
+        return np.nan
+    lower = [h for h in heights if h <= target_height]
+    base_h = max(lower) if lower else min(heights)
+    data, meta = wind_maps_source[base_h]
+    u_base = sample_raster(data, meta, lat, lon)
+    if np.isnan(u_base) or u_base <= 0:
+        return np.nan
+    return u_base * (target_height / base_h) ** alpha
+
+
+def haversine_km(lat1, lon1, lat2, lon2):
+    """Great-circle distance in km - used for calibration distance-weighting
+    instead of the original's flat degree-difference approximation, which
+    distorts longitude distances away from the equator."""
+    lat1r, lon1r, lat2r, lon2r = map(np.radians, [lat1, lon1, lat2, lon2])
+    dlat, dlon = lat2r - lat1r, lon2r - lon1r
+    a = np.sin(dlat / 2) ** 2 + np.cos(lat1r) * np.cos(lat2r) * np.sin(dlon / 2) ** 2
+    return 2 * 6371.0 * np.arcsin(np.sqrt(a))
+
+
+@st.cache_data(show_spinner="Computing shear at each turbine position...")
+def compute_layout_shear(era5_maps, cfsr_maps, layout_coords):
+    """Per-position ERA5 alpha, CFSR alpha, and their average, for every
+    (lat, lon) in layout_coords."""
+    results = []
+    for lat, lon in layout_coords:
+        a_e, r2_e, n_e = compute_shear_at_point(era5_maps, lat, lon) if era5_maps else (np.nan, np.nan, 0)
+        a_c, r2_c, n_c = compute_shear_at_point(cfsr_maps, lat, lon) if cfsr_maps else (np.nan, np.nan, 0)
+        valid = [a for a in (a_e, a_c) if not np.isnan(a)]
+        avg = float(np.mean(valid)) if valid else np.nan
+        results.append({"era5_alpha": a_e, "era5_r2": r2_e, "era5_n": n_e,
+                         "cfsr_alpha": a_c, "cfsr_r2": r2_c, "cfsr_n": n_c,
+                         "avg_alpha": avg})
+    return results
+
+
+@st.cache_data(show_spinner="Extrapolating to hub height and applying weights...")
+def compute_hub_height_results(era5_maps, cfsr_maps, layout_coords, shear_results,
+                                hub_height, w_era5):
+    """Per-position ERA5/CFSR wind speed at hub height, plus the weighted blend.
+    The weighted value requires BOTH sources to be valid at that position -
+    that's the whole point of this tool - but the individual source values are
+    still reported even where only one is valid, for diagnostic purposes."""
+    w_cfsr = 1 - w_era5
+    results = []
+    for (lat, lon), sh in zip(layout_coords, shear_results):
+        u_era5 = sample_at_height(era5_maps, lat, lon, hub_height, sh["era5_alpha"])
+        u_cfsr = sample_at_height(cfsr_maps, lat, lon, hub_height, sh["cfsr_alpha"])
+        weighted = (u_era5 * w_era5 + u_cfsr * w_cfsr
+                    if not (np.isnan(u_era5) or np.isnan(u_cfsr)) else np.nan)
+        results.append({"era5_hh_ws": u_era5, "cfsr_hh_ws": u_cfsr, "weighted_hh_ws": weighted})
+    return results
+
+
+@st.cache_data(show_spinner="Computing calibration factors...")
+def compute_calibration_factors(era5_maps, cfsr_maps, cal_points, w_era5):
+    """For each calibration point, computes the model wind speed AT THAT
+    POINT'S OWN LOCATION AND HEIGHT directly - using local shear fitted at
+    that exact (lat, lon), same as for turbines - then CF = measured / model.
+    This is more direct than the original tool, which extrapolated to hub
+    height first and then back down to the calibration height using a single
+    site-wide shear number; going straight from the raster heights to the
+    target height with the local shear avoids that indirection entirely."""
+    w_cfsr = 1 - w_era5
+    factors = []
+    for pt in cal_points:
+        lat, lon, h = pt["lat"], pt["lon"], pt["h"]
+        a_e, _, _ = compute_shear_at_point(era5_maps, lat, lon) if era5_maps else (np.nan, np.nan, 0)
+        a_c, _, _ = compute_shear_at_point(cfsr_maps, lat, lon) if cfsr_maps else (np.nan, np.nan, 0)
+        u_era5 = sample_at_height(era5_maps, lat, lon, h, a_e)
+        u_cfsr = sample_at_height(cfsr_maps, lat, lon, h, a_c)
+        if np.isnan(u_era5) or np.isnan(u_cfsr):
+            continue
+        u_model = u_era5 * w_era5 + u_cfsr * w_cfsr
+        if u_model <= 0:
+            continue
+        factors.append({"name": pt["name"], "lat": lat, "lon": lon, "h": h,
+                         "meas_ws": pt["ws"], "model_ws": u_model, "cf": pt["ws"] / u_model})
+    return factors
+
+
+def apply_calibration(weighted_hh_ws_list, layout_coords, factors, method, decay_km=250.0):
+    """Site Average CF: one calibration factor applied uniformly everywhere.
+    Distance Weighted CF: each turbine's factor is an exponential-decay-weighted
+    blend of every calibration point's factor, using true great-circle distance.
+    Returns (calibrated_ws_list, influence_list) or (None, None) if no factors."""
+    n_cal = len(factors)
+    if n_cal == 0:
+        return None, None
+
+    if method == "Site Average CF":
+        avg_cf = np.mean([f["cf"] for f in factors])
+        calibrated = [w * avg_cf if not np.isnan(w) else np.nan for w in weighted_hh_ws_list]
+        return calibrated, [1.0 / n_cal] * n_cal
+
+    calibrated = []
+    weight_tracker = np.zeros(n_cal)
+    for (lat, lon), w_ws in zip(layout_coords, weighted_hh_ws_list):
+        if np.isnan(w_ws):
+            calibrated.append(np.nan)
+            continue
+        dists = np.array([haversine_km(lat, lon, f["lat"], f["lon"]) for f in factors])
+        w = np.exp(-dists / decay_km)
+        w_norm = w / np.sum(w)
+        weight_tracker += w_norm
+        cf_local = np.sum(w_norm * np.array([f["cf"] for f in factors]))
+        calibrated.append(w_ws * cf_local)
+    influence = (weight_tracker / len(layout_coords)).tolist()
+    return calibrated, influence
+
+
+def build_results_map_fig(boundary_gdf, layout_gdf, values, value_label, cal_points=None):
+    """Layout coloured/labelled by a precomputed per-position value (hub-height
+    or calibrated wind speed) rather than a raster - same padding/uirevision
+    treatment as the Measurement Campaign Planning maps, so pan/zoom persists
+    across reruns and the default view is the boundary, not whatever the
+    layout's bounding box happens to be."""
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    if boundary_gdf is not None:
+        bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
+        fig.add_trace(go.Scatter(x=list(bx), y=list(by), mode="lines",
+                                  line=dict(color="black", width=2),
+                                  showlegend=False, hoverinfo="skip"))
+
+    if layout_gdf is not None:
+        lx = [g.x for g in layout_gdf.geometry]
+        ly = [g.y for g in layout_gdf.geometry]
+        text = [f"{v:.2f}" if not np.isnan(v) else "n/a" for v in values]
+        fig.add_trace(go.Scatter(
+            x=lx, y=ly, mode="markers+text",
+            marker=dict(size=14, color=values, colorscale="Viridis", showscale=True,
+                        colorbar=dict(title=value_label),
+                        line=dict(color="black", width=1)),
+            text=text, textposition="top center", textfont=dict(color="black", size=9),
+            name="Layout", showlegend=False,
+            hovertemplate="%{text} m/s<extra></extra>"))
+
+    if cal_points:
+        cx = [p["lon"] for p in cal_points]
+        cy = [p["lat"] for p in cal_points]
+        ctxt = [p["name"] for p in cal_points]
+        chover = [f"{p['name']}<br>Measured: {p['ws']:.2f} m/s @ {p['h']:.0f} m"
+                  for p in cal_points]
+        fig.add_trace(go.Scatter(x=cx, y=cy, mode="markers+text",
+                                  marker=dict(symbol="star", size=16, color="red",
+                                              line=dict(color="black", width=1)),
+                                  text=ctxt, textposition="bottom center",
+                                  hovertext=chover, hoverinfo="text",
+                                  name="Calibration point", showlegend=False))
+
+    fig.update_layout(height=650, margin=dict(l=10, r=10, t=10, b=10),
+                       xaxis_title="Longitude", yaxis_title="Latitude",
+                       yaxis=dict(scaleanchor="x", scaleratio=1), dragmode="pan")
+
+    if boundary_gdf is not None:
+        bx0, by0, bx1, by1 = boundary_gdf.total_bounds
+        pad_x = (bx1 - bx0) * 0.20 or 0.01
+        pad_y = (by1 - by0) * 0.20 or 0.01
+        fig.update_xaxes(range=[bx0 - pad_x, bx1 + pad_x])
+        fig.update_yaxes(range=[by0 - pad_y, by1 + pad_y])
+        fig.update_layout(uirevision=boundary_gdf.geometry.iloc[0].wkt + value_label)
+
+    return fig
+
+
+def render_wra_static_map(boundary_gdf, layout_gdf, values, value_label, title,
+                           cal_points=None):
+    """Static matplotlib equivalent of build_results_map_fig, for the download
+    package (avoids a kaleido/headless-Chrome dependency for exporting the
+    interactive Plotly figure)."""
+    import matplotlib.patheffects as pe
+    outline = [pe.withStroke(linewidth=2.5, foreground="white")]
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+
+    if boundary_gdf is not None:
+        boundary_gdf.plot(ax=ax, facecolor="none", edgecolor="black", linewidth=2)
+
+    if layout_gdf is not None:
+        lx = [g.x for g in layout_gdf.geometry]
+        ly = [g.y for g in layout_gdf.geometry]
+        sc = ax.scatter(lx, ly, c=values, cmap="viridis", s=80, edgecolor="black",
+                        linewidth=0.8, zorder=4)
+        cbar = fig.colorbar(sc, ax=ax, fraction=0.045, pad=0.02)
+        cbar.set_label(value_label)
+        for x, y, v in zip(lx, ly, values):
+            if not np.isnan(v):
+                txt = ax.annotate(f"{v:.2f}", (x, y), fontsize=7, color="black",
+                                   xytext=(3, 3), textcoords="offset points", zorder=5)
+                txt.set_path_effects(outline)
+
+    if cal_points:
+        for p in cal_points:
+            ax.plot(p["lon"], p["lat"], "*", color="red", markersize=16,
+                    markeredgecolor="black", zorder=6)
+            txt = ax.annotate(p["name"], (p["lon"], p["lat"]), fontsize=9,
+                               fontweight="bold", color="black", xytext=(5, -10),
+                               textcoords="offset points", zorder=7)
+            txt.set_path_effects(outline)
+
+    if boundary_gdf is not None:
+        bx0, by0, bx1, by1 = boundary_gdf.total_bounds
+        pad_x = (bx1 - bx0) * 0.20 or 0.01
+        pad_y = (by1 - by0) * 0.20 or 0.01
+        ax.set_xlim(bx0 - pad_x, bx1 + pad_x)
+        ax.set_ylim(by0 - pad_y, by1 + pad_y)
+
+    ax.set_xlabel("Longitude")
+    ax.set_ylabel("Latitude")
+    ax.set_title(title)
+    fig.tight_layout()
+    return fig
+
+
+def build_wra_excel(boundary_gdf, layout_gdf, hub_height_results, calibrated_ws=None,
+                     cal_points=None, cal_factors=None):
+    """Site Boundary, Layout, per-position ERA5/CFSR/Weighted (and Calibrated,
+    if available) hub-height wind speed, plus calibration diagnostics."""
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        if boundary_gdf is not None:
+            bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
+            pd.DataFrame({"Latitude": list(by), "Longitude": list(bx)}).to_excel(
+                writer, sheet_name="Site Boundary", index=False)
+
+        if layout_gdf is not None:
+            lat = [g.y for g in layout_gdf.geometry]
+            lon = [g.x for g in layout_gdf.geometry]
+            rows = []
+            for i in range(len(lat)):
+                row = {"Turbine": f"T{i+1}", "Latitude": lat[i], "Longitude": lon[i],
+                       "ERA5 Wind Speed (m/s)": hub_height_results[i]["era5_hh_ws"],
+                       "CFSR Wind Speed (m/s)": hub_height_results[i]["cfsr_hh_ws"],
+                       "Weighted Wind Speed (m/s)": hub_height_results[i]["weighted_hh_ws"]}
+                if calibrated_ws is not None:
+                    row["Calibrated Wind Speed (m/s)"] = calibrated_ws[i]
+                rows.append(row)
+            df_ws = pd.DataFrame(rows)
+            df_ws.to_excel(writer, sheet_name="Wind Speed by Position", index=False)
+
+            summary = {
+                "Metric": ["Mean ERA5 Wind Speed (m/s)", "Mean CFSR Wind Speed (m/s)",
+                           "Mean Weighted Wind Speed (m/s)"],
+                "Value": [df_ws["ERA5 Wind Speed (m/s)"].mean(),
+                          df_ws["CFSR Wind Speed (m/s)"].mean(),
+                          df_ws["Weighted Wind Speed (m/s)"].mean()],
+            }
+            if calibrated_ws is not None:
+                summary["Metric"].append("Mean Calibrated Wind Speed (m/s)")
+                summary["Value"].append(df_ws["Calibrated Wind Speed (m/s)"].mean())
+            pd.DataFrame(summary).to_excel(writer, sheet_name="Summary", index=False)
+
+        if cal_points:
+            pd.DataFrame(cal_points).to_excel(writer, sheet_name="Calibration Points",
+                                               index=False)
+        if cal_factors:
+            pd.DataFrame(cal_factors).to_excel(writer, sheet_name="Calibration Factors",
+                                                index=False)
+
+    buf.seek(0)
+    return buf.read()
+
+
 if mode == "Long-Term Correction":
     st.title("Wind Resource Analysis Tool")
     st.caption("Upload your measurement data and a modelled wind dataset to get availability, "
                "monthly means, shear, wind roses, correlation and a long-term corrected wind speed.")
 
     # ------------------------------------------------------------------ STEP 1 --
-    st.header("1. Upload Measurement Data")
+    st.header("1. Upload measurement data")
     meas_file = st.file_uploader("Measurement CSV (lidar / met mast, any column layout, up to 500MB)",
                                   type="csv")
 
@@ -1054,7 +1381,7 @@ if mode == "Long-Term Correction":
 
         all_cols = list(raw_df.columns)
 
-        st.subheader("1a. Column Mapping")
+        st.subheader("1a. Column mapping")
         c1, c2 = st.columns(2)
         with c1:
             ts_col = st.selectbox("Timestamp column", all_cols)
@@ -1095,7 +1422,7 @@ if mode == "Long-Term Correction":
         st.divider()
 
         # -------------------------------------------------------------- STEP 2 --
-        st.header("2. Upload Modelled Wind Data")
+        st.header("2. Upload modelled wind data")
         st.caption("Any hourly modelled/reanalysis wind time series works here - ERA5, CFSR, "
                    "MERRA-2, Vortex, or similar.")
         model_file = st.file_uploader("Modelled wind dataset file (CSV or Vortex .txt)",
@@ -1117,7 +1444,7 @@ if mode == "Long-Term Correction":
                 model_cols = [c for c in raw_model_df.columns if c != "Timestamp"]
                 model_ts_col, model_dayfirst = "Timestamp", False
 
-                st.subheader("2a. Column Mapping")
+                st.subheader("2a. Column mapping")
                 st.caption("Timestamp is already handled automatically for Vortex files - just "
                            "confirm the wind speed and direction columns.")
                 mc1, mc2 = st.columns(2)
@@ -1155,7 +1482,7 @@ if mode == "Long-Term Correction":
 
                 model_cols = list(raw_model_df.columns)
 
-                st.subheader("2a. Column Mapping")
+                st.subheader("2a. Column mapping")
                 mc1, mc2 = st.columns(2)
                 with mc1:
                     model_ts_col = st.selectbox("Timestamp column", model_cols, key="model_ts_col")
@@ -1189,7 +1516,7 @@ if mode == "Long-Term Correction":
             if not is_vortex:
                 timestamp_diagnostics_ui(raw_model_df, model_ts_col, model_dayfirst, key_prefix="model")
 
-            st.subheader("2b. Timezone Alignment")
+            st.subheader("2b. Timezone alignment")
             tzc1, tzc2 = st.columns(2)
             with tzc1:
                 utc_offset = st.number_input(
@@ -1197,7 +1524,8 @@ if mode == "Long-Term Correction":
                     "measurement timestamps are UTC+8.", value=0.0, step=0.5, key="meas_utc_offset")
             with tzc2:
                 model_utc_offset = st.number_input(
-                    "Modelled dataset timezone offset from UTC (hours). Vortex files are typically in "
+                    "Modelled dataset timezone offset from UTC (hours). Most reanalysis products "
+                    "(ERA5, CFSR, MERRA-2) are already UTC (0); Vortex files are typically in "
                     "local time and this is pre-filled from the file header.",
                     value=model_tz_default, step=0.5, key="model_utc_offset")
 
@@ -1287,7 +1615,7 @@ if mode == "Long-Term Correction":
 
             # ---- Data availability ----
             with tabs[0]:
-                st.subheader("Data Availability by Height and Month")
+                st.subheader("Data availability by height and month")
                 table = availability_table(meas_df, height_map)
                 fig = plot_availability_bars(table, threshold=min_avail)
                 show_fig(fig, width=WIDTH_AVAILABILITY)
@@ -1344,7 +1672,7 @@ if mode == "Long-Term Correction":
 
             # ---- Shear ----
             with tabs[3]:
-                st.subheader("Shear Exponent (Profile Fit Method)")
+                st.subheader("Shear exponent (profile method)")
                 st.caption(f"Using the availability threshold set above ({min_avail}%).")
                 if shear_data is None:
                     st.warning("Fewer than 3 heights meet the availability threshold - "
@@ -1542,8 +1870,8 @@ elif mode == "Measurement Campaign Planning":
             st.session_state[_k] = _v
 
     # ------------------------------------------------------------------ STEP 1 --
-    st.header("1. Site Boundary")
-    boundary_file = st.file_uploader("Site Boundary (GeoJSON)", type=["geojson"],
+    st.header("1. Site boundary")
+    boundary_file = st.file_uploader("Site boundary (GeoJSON)", type=["geojson"],
                                       key="camp_boundary_file")
     if boundary_file is not None and st.session_state.camp_boundary is None:
         try:
@@ -1557,7 +1885,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 2 --
-    st.header("2. Wind Maps (Modelled)")
+    st.header("2. Wind maps (modelled data)")
     st.caption("Upload one or more ESRI ASCII grid (.asc) wind speed maps - e.g. Vortex map "
                "exports - each tagged with a source and height.")
     if "camp_wm_uploader_key" not in st.session_state:
@@ -1598,7 +1926,7 @@ elif mode == "Measurement Campaign Planning":
         map_keys = list(st.session_state.camp_wind_maps.keys())
         map_labels = [f"{s} @ {h} m" for s, h in map_keys]
 
-        st.write(f"**Loaded Wind Maps ({len(map_keys)}):**")
+        st.write(f"**Loaded wind maps ({len(map_keys)}):**")
         loaded_df = pd.DataFrame([{"Source": s, "Height (m)": h} for s, h in map_keys])
         st.dataframe(loaded_df, hide_index=True, width="stretch")
 
@@ -1621,7 +1949,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 3 --
-    st.header("3. Turbine Layout (Optional)")
+    st.header("3. Turbine layout (optional)")
     st.caption("Used for the best-measurement-point search (step 6) and optional wind speed "
                "labels on the map. Accepts .geojson, .gpkg, or .xlsx (with Latitude/Longitude "
                "columns) - not raw .shp, since that format is really several files bundled "
@@ -1666,7 +1994,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 4 --
-    st.header("4. Interactive Map")
+    st.header("4. Interactive map")
     if st.session_state.camp_boundary is None:
         st.info("Upload a site boundary above to see the map.")
     else:
@@ -1778,7 +2106,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 6 --
-    st.header("6. Locate Best Measurement Point(s) (K-Means)")
+    st.header("6. Locate best measurement points (K-Means)")
     st.caption("Groups your turbines into clusters, then searches inside the boundary for the "
                "point in each cluster whose modelled wind speed best represents that cluster "
                "(weighted against distance to the turbines it represents).")
@@ -1788,7 +2116,7 @@ elif mode == "Measurement Campaign Planning":
     else:
         n_clusters = st.number_input("Number of measurement locations", min_value=1, max_value=20,
                                       value=1, step=1, key="camp_n_clusters")
-        if st.button("Locate Best Measurement Points", type="primary"):
+        if st.button("Locate best measurement points", type="primary"):
             data, meta = st.session_state.camp_wind_maps[st.session_state.camp_active_map]
             boundary_gdf = st.session_state.camp_boundary
             bounds = tuple(boundary_gdf.total_bounds)
@@ -1820,7 +2148,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 7 --
-    st.header("7. Download All Statistics")
+    st.header("7. Download all statistics")
     st.caption("Bundles the comparison plots, an Excel workbook (site boundary, layout, "
                "layout wind speeds, and best measurement points), and one combined overview "
                "figure into a single ZIP.")
@@ -1866,5 +2194,401 @@ elif mode == "Measurement Campaign Planning":
     if st.button("Reset planning tool"):
         for _k in list(st.session_state.keys()):
             if _k.startswith("camp_"):
+                del st.session_state[_k]
+        st.rerun()
+
+elif mode == "Preliminary Wind Resource Assessment":
+    st.title("Preliminary Wind Resource Assessment")
+    st.caption("Multi-source (ERA5 + CFSR) shear, hub-height extrapolation, weighting, and "
+               "long-term calibration across a turbine layout.")
+
+    for _k, _v in [("wra_boundary", None), ("wra_layout", None),
+                   ("wra_wind_maps", {"ERA5": {}, "CFSR": {}}), ("wra_active_map", None),
+                   ("wra_shear_results", None), ("wra_hh_results", None),
+                   ("wra_cal_points", []), ("wra_cal_factors", None),
+                   ("wra_calibrated_ws", None), ("wra_cal_influence", None)]:
+        if _k not in st.session_state:
+            st.session_state[_k] = _v
+
+    # ------------------------------------------------------------------ STEP 1 --
+    st.header("1. Site Boundary")
+    wra_boundary_file = st.file_uploader("Site boundary (GeoJSON)", type=["geojson"],
+                                          key="wra_boundary_file")
+    if wra_boundary_file is not None and st.session_state.wra_boundary is None:
+        try:
+            st.session_state.wra_boundary = read_geo_file_from_bytes(
+                wra_boundary_file.getvalue(), ".geojson")
+        except Exception as e:
+            st.error(f"Could not read boundary file: {e}")
+    if st.session_state.wra_boundary is not None:
+        st.success("Boundary loaded.")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 2 --
+    st.header("2. Layout")
+    wra_layout_file = st.file_uploader("Layout file (.geojson, .gpkg, or .xlsx)",
+                                        type=["geojson", "gpkg", "xlsx"], key="wra_layout_file")
+    if wra_layout_file is not None:
+        fname = wra_layout_file.name
+        if fname.lower().endswith(".xlsx"):
+            raw_preview = pd.read_excel(io.BytesIO(wra_layout_file.getvalue()))
+            cols = list(raw_preview.columns)
+            lc1, lc2, lc3 = st.columns([1, 1, 1])
+            with lc1:
+                wra_lat_col = st.selectbox("Latitude column", cols,
+                                            index=cols.index("Latitude") if "Latitude" in cols else 0,
+                                            key="wra_lat_col")
+            with lc2:
+                wra_lon_col = st.selectbox("Longitude column", cols,
+                                            index=cols.index("Longitude") if "Longitude" in cols else 0,
+                                            key="wra_lon_col")
+            with lc3:
+                st.write("")
+                st.write("")
+                if st.button("Load Layout"):
+                    try:
+                        st.session_state.wra_layout = read_layout_file(
+                            wra_layout_file.getvalue(), fname, wra_lat_col, wra_lon_col)
+                    except Exception as e:
+                        st.error(f"Could not read layout: {e}")
+        else:
+            try:
+                st.session_state.wra_layout = read_layout_file(wra_layout_file.getvalue(), fname)
+            except Exception as e:
+                st.error(f"Could not read layout: {e}")
+
+    if st.session_state.wra_layout is not None:
+        st.success(f"Layout loaded ({len(st.session_state.wra_layout)} turbines).")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 3 --
+    st.header("3. Wind Maps")
+    st.caption("Upload every .asc file for each source - drag-and-drop the whole folder "
+               "(Chrome/Edge expand a dropped folder automatically) or select all the files "
+               "at once. Height is read from each filename (e.g. 'site.M.100m.asc').")
+
+    wmc1, wmc2 = st.columns(2)
+    for _source, _col in [("ERA5", wmc1), ("CFSR", wmc2)]:
+        with _col:
+            st.subheader(_source)
+            _files = st.file_uploader(f"{_source} .asc files", type=["asc"],
+                                       accept_multiple_files=True, key=f"wra_{_source.lower()}_files")
+            if _files:
+                _maps, _skipped = {}, []
+                for _f in _files:
+                    _h = detect_asc_height(_f.name)
+                    if _h is None:
+                        _skipped.append(_f.name)
+                        continue
+                    _data, _meta = cached_read_ascii_grid(_f.getvalue())
+                    _maps[_h] = (_data, _meta)
+                st.session_state.wra_wind_maps[_source] = _maps
+                if _maps:
+                    st.success(f"{len(_maps)} height(s) loaded: {sorted(_maps.keys())} m")
+                if _skipped:
+                    st.warning(f"Could not detect height from {len(_skipped)} file(s): "
+                               f"{', '.join(_skipped[:5])}{' ...' if len(_skipped) > 5 else ''}")
+
+    era5_maps = st.session_state.wra_wind_maps["ERA5"]
+    cfsr_maps = st.session_state.wra_wind_maps["CFSR"]
+
+    if era5_maps or cfsr_maps:
+        st.write("**Loaded wind maps:**")
+        _rows = ([{"Source": "ERA5", "Height (m)": h} for h in sorted(era5_maps.keys())] +
+                 [{"Source": "CFSR", "Height (m)": h} for h in sorted(cfsr_maps.keys())])
+        st.dataframe(pd.DataFrame(_rows), hide_index=True, width="stretch")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 4 --
+    st.header("4. Interactive Map")
+    all_maps = {("ERA5", h): v for h, v in era5_maps.items()}
+    all_maps.update({("CFSR", h): v for h, v in cfsr_maps.items()})
+
+    if st.session_state.wra_boundary is None:
+        st.info("Upload a site boundary above to see the map.")
+    elif not all_maps:
+        st.info("Load at least one wind map above to browse it here.")
+    else:
+        map_keys = sorted(all_maps.keys())
+        map_labels = [f"{s} @ {h} m" for s, h in map_keys]
+        default_idx = (map_keys.index(st.session_state.wra_active_map)
+                       if st.session_state.wra_active_map in map_keys else 0)
+        chosen_label = st.selectbox("Map to display", map_labels, index=default_idx,
+                                     key="wra_active_map_select")
+        st.session_state.wra_active_map = map_keys[map_labels.index(chosen_label)]
+
+        wra_show_ws = False
+        if st.session_state.wra_layout is not None:
+            wra_show_ws = st.checkbox("Show wind speed at each turbine on the map",
+                                       key="wra_show_ws")
+
+        active = all_maps[st.session_state.wra_active_map]
+        fig, _ = build_planning_map_fig(active, st.session_state.wra_boundary,
+                                         st.session_state.wra_layout, wra_show_ws, [], [], None)
+        st.plotly_chart(fig, width="stretch", key="wra_map_chart")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 5 --
+    st.header("5. Shear Calculation")
+    st.caption("For every turbine, fits a power-law shear exponent to ERA5's own heights and "
+               "CFSR's own heights separately (not one number pooled across the whole site), "
+               "then averages the two per position. Needs at least 2 heights per source.")
+
+    if st.session_state.wra_layout is None:
+        st.info("Load a layout above to compute shear.")
+    elif len(era5_maps) < 2 and len(cfsr_maps) < 2:
+        st.info("Need at least 2 heights loaded for ERA5 or CFSR to compute shear.")
+    else:
+        if st.button("Compute Shear"):
+            layout_coords = tuple((g.y, g.x) for g in st.session_state.wra_layout.geometry)
+            st.session_state.wra_shear_results = compute_layout_shear(era5_maps, cfsr_maps,
+                                                                        layout_coords)
+
+        if st.session_state.wra_shear_results:
+            sr = st.session_state.wra_shear_results
+            era5_alphas = [r["era5_alpha"] for r in sr if not np.isnan(r["era5_alpha"])]
+            cfsr_alphas = [r["cfsr_alpha"] for r in sr if not np.isnan(r["cfsr_alpha"])]
+            avg_alphas = [r["avg_alpha"] for r in sr if not np.isnan(r["avg_alpha"])]
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Mean ERA5 shear", f"{np.mean(era5_alphas):.3f}" if era5_alphas else "n/a")
+            with m2:
+                st.metric("Mean CFSR shear", f"{np.mean(cfsr_alphas):.3f}" if cfsr_alphas else "n/a")
+            with m3:
+                st.metric("Mean combined shear", f"{np.mean(avg_alphas):.3f}" if avg_alphas else "n/a")
+
+            with st.expander("Per-position shear detail"):
+                shear_df = pd.DataFrame(sr)
+                shear_df.insert(0, "Turbine", [f"T{i+1}" for i in range(len(sr))])
+                st.dataframe(shear_df, hide_index=True, width="stretch")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 6 --
+    st.header("6. Hub Height & Weighting")
+    if st.session_state.wra_shear_results is None:
+        st.info("Compute shear above first.")
+    elif not era5_maps or not cfsr_maps:
+        st.info("Load both ERA5 and CFSR maps to blend a weighted result.")
+    else:
+        hc1, hc2 = st.columns(2)
+        with hc1:
+            wra_hub_height = st.number_input("Hub height (m)", min_value=1.0, value=100.0,
+                                              step=1.0, key="wra_hub_height")
+        with hc2:
+            wra_era5_weight_pct = st.slider("ERA5 weight (%)", 0, 100, 67, key="wra_era5_weight_pct")
+            st.caption(f"CFSR weight: {100 - wra_era5_weight_pct}%")
+
+        if st.button("Compute Hub Height Wind Speed", type="primary"):
+            layout_coords = tuple((g.y, g.x) for g in st.session_state.wra_layout.geometry)
+            st.session_state.wra_hh_results = compute_hub_height_results(
+                era5_maps, cfsr_maps, layout_coords, st.session_state.wra_shear_results,
+                wra_hub_height, wra_era5_weight_pct / 100)
+            # Any previous calibration was computed against the old hub-height/weights - clear it
+            st.session_state.wra_cal_factors = None
+            st.session_state.wra_calibrated_ws = None
+            st.session_state.wra_cal_influence = None
+
+        if st.session_state.wra_hh_results:
+            hhr = st.session_state.wra_hh_results
+            era5_vals = [r["era5_hh_ws"] for r in hhr if not np.isnan(r["era5_hh_ws"])]
+            cfsr_vals = [r["cfsr_hh_ws"] for r in hhr if not np.isnan(r["cfsr_hh_ws"])]
+            weighted_vals = [r["weighted_hh_ws"] for r in hhr if not np.isnan(r["weighted_hh_ws"])]
+
+            m1, m2, m3 = st.columns(3)
+            with m1:
+                st.metric("Mean ERA5 WS", f"{np.mean(era5_vals):.2f} m/s" if era5_vals else "n/a")
+            with m2:
+                st.metric("Mean CFSR WS", f"{np.mean(cfsr_vals):.2f} m/s" if cfsr_vals else "n/a")
+            with m3:
+                st.metric("Average Modelled Wind Speed at the Windfarm",
+                          f"{np.mean(weighted_vals):.2f} m/s" if weighted_vals else "n/a")
+
+            fig = build_results_map_fig(st.session_state.wra_boundary, st.session_state.wra_layout,
+                                         [r["weighted_hh_ws"] for r in hhr], "Weighted WS (m/s)")
+            st.plotly_chart(fig, width="stretch", key="wra_hh_map_chart")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 7 --
+    st.header("7. Calibration")
+    st.caption("Adjusts the modelled result toward long-term-corrected measurements at known "
+               "locations. For each point, the model's wind speed is computed directly at that "
+               "point's own location and height, compared to the measured value to get a "
+               "calibration factor (CF) - then either one site-wide average CF is applied "
+               "everywhere, or each turbine gets a distance-weighted blend of every point's CF "
+               "(nearer points count more, using true great-circle distance).")
+
+    if st.session_state.wra_hh_results is None:
+        st.info("Compute Hub Height Wind Speed above first.")
+    else:
+        st.subheader("7a. Calibration points")
+        cpc1, cpc2, cpc3, cpc4, cpc5 = st.columns(5)
+        with cpc1:
+            cp_name = st.text_input("Name", value=f"M{len(st.session_state.wra_cal_points)+1}",
+                                     key="wra_cp_name")
+        with cpc2:
+            cp_lat = st.number_input("Latitude", format="%.5f", key="wra_cp_lat")
+        with cpc3:
+            cp_lon = st.number_input("Longitude", format="%.5f", key="wra_cp_lon")
+        with cpc4:
+            cp_h = st.number_input("Height (m)", min_value=1.0, value=100.0, key="wra_cp_h")
+        with cpc5:
+            cp_ws = st.number_input("Long-term WS (m/s)", min_value=0.0, key="wra_cp_ws")
+
+        bc1, bc2 = st.columns(2)
+        with bc1:
+            if st.button("Add Point"):
+                st.session_state.wra_cal_points.append(
+                    {"name": cp_name, "lat": cp_lat, "lon": cp_lon, "h": cp_h, "ws": cp_ws})
+        with bc2:
+            if st.button("Clear Points"):
+                st.session_state.wra_cal_points = []
+
+        st.caption("Or import a CSV of calibration points (any column names - you map them below).")
+        cal_csv = st.file_uploader("Calibration CSV", type=["csv"], key="wra_cal_csv")
+        if cal_csv is not None:
+            cal_raw = pd.read_csv(cal_csv)
+            cal_cols = list(cal_raw.columns)
+
+            def _guess(cols, keywords, default=0):
+                for kw in keywords:
+                    for i, c in enumerate(cols):
+                        if kw.lower() in c.lower():
+                            return i
+                return default
+
+            mc1, mc2, mc3, mc4, mc5, mc6 = st.columns(6)
+            with mc1:
+                col_name = st.selectbox("Name col", cal_cols,
+                                         index=_guess(cal_cols, ["name", "site"]), key="wra_csv_name")
+            with mc2:
+                col_lat = st.selectbox("Lat col", cal_cols,
+                                        index=_guess(cal_cols, ["lat"]), key="wra_csv_lat")
+            with mc3:
+                col_lon = st.selectbox("Lon col", cal_cols,
+                                        index=_guess(cal_cols, ["lon"]), key="wra_csv_lon")
+            with mc4:
+                col_h = st.selectbox("Height col", cal_cols,
+                                      index=_guess(cal_cols, ["height", "h "]), key="wra_csv_h")
+            with mc5:
+                col_ws = st.selectbox("WS col", cal_cols,
+                                       index=_guess(cal_cols, ["wind speed", "ws"]), key="wra_csv_ws")
+            with mc6:
+                st.write("")
+                st.write("")
+                if st.button("Import CSV"):
+                    imported = [{"name": str(row[col_name]), "lat": float(row[col_lat]),
+                                 "lon": float(row[col_lon]), "h": float(row[col_h]),
+                                 "ws": float(row[col_ws])} for _, row in cal_raw.iterrows()]
+                    st.session_state.wra_cal_points.extend(imported)
+
+        if st.session_state.wra_cal_points:
+            st.dataframe(pd.DataFrame(st.session_state.wra_cal_points), hide_index=True,
+                         width="stretch")
+
+        if len(st.session_state.wra_cal_points) >= 1:
+            st.subheader("7b. Run calibration")
+            mcol1, mcol2 = st.columns(2)
+            with mcol1:
+                wra_cal_method = st.radio("Calibration method",
+                                           ["Site Average CF", "Distance Weighted CF"],
+                                           key="wra_cal_method")
+            with mcol2:
+                wra_decay_km = st.number_input("Decay length (km)", min_value=1.0, value=250.0,
+                                                step=10.0, key="wra_decay_km",
+                                                disabled=(wra_cal_method == "Site Average CF"))
+
+            if st.button("Start Calibration", type="primary"):
+                w_era5 = st.session_state.get("wra_era5_weight_pct", 67) / 100
+                factors = compute_calibration_factors(era5_maps, cfsr_maps,
+                                                        st.session_state.wra_cal_points, w_era5)
+                if not factors:
+                    st.error("No valid calibration factors - check the points fall within the "
+                             "wind map coverage.")
+                else:
+                    layout_coords = tuple((g.y, g.x) for g in st.session_state.wra_layout.geometry)
+                    weighted_list = [r["weighted_hh_ws"] for r in st.session_state.wra_hh_results]
+                    calibrated, influence = apply_calibration(
+                        weighted_list, layout_coords, factors, wra_cal_method, wra_decay_km)
+                    st.session_state.wra_cal_factors = factors
+                    st.session_state.wra_calibrated_ws = calibrated
+                    st.session_state.wra_cal_influence = influence
+
+        if st.session_state.wra_cal_factors:
+            st.write("**Calibration factors:**")
+            st.dataframe(pd.DataFrame(st.session_state.wra_cal_factors), hide_index=True,
+                         width="stretch")
+
+            avg_cf = np.mean([f["cf"] for f in st.session_state.wra_cal_factors])
+            cal_vals = [c for c in st.session_state.wra_calibrated_ws if not np.isnan(c)]
+            m1, m2 = st.columns(2)
+            with m1:
+                st.metric("Average CF", f"{avg_cf:.3f}")
+            with m2:
+                st.metric("Calibrated Average Wind Speed at the Windfarm",
+                          f"{np.mean(cal_vals):.2f} m/s" if cal_vals else "n/a")
+
+            st.write("**Average influence of each calibration point:**")
+            infl_df = pd.DataFrame([
+                {"Point": f["name"], "Influence": f"{inf*100:.1f}%"}
+                for f, inf in zip(st.session_state.wra_cal_factors, st.session_state.wra_cal_influence)
+            ])
+            st.dataframe(infl_df, hide_index=True, width="stretch")
+
+            fig = build_results_map_fig(st.session_state.wra_boundary, st.session_state.wra_layout,
+                                         st.session_state.wra_calibrated_ws, "Calibrated WS (m/s)",
+                                         cal_points=st.session_state.wra_cal_points)
+            st.plotly_chart(fig, width="stretch", key="wra_cal_map_chart")
+
+    st.divider()
+
+    # ------------------------------------------------------------------ STEP 8 --
+    st.header("8. Download Plots and Table")
+    if st.session_state.wra_hh_results is None:
+        st.info("Compute Hub Height Wind Speed above first.")
+    else:
+        if st.button("Prepare download package"):
+            with st.spinner("Building download package..."):
+                buf = io.BytesIO()
+                with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+                    excel_bytes = build_wra_excel(
+                        st.session_state.wra_boundary, st.session_state.wra_layout,
+                        st.session_state.wra_hh_results,
+                        calibrated_ws=st.session_state.wra_calibrated_ws,
+                        cal_points=st.session_state.wra_cal_points or None,
+                        cal_factors=st.session_state.wra_cal_factors)
+                    zf.writestr("wra_results.xlsx", excel_bytes)
+
+                    weighted_fig = render_wra_static_map(
+                        st.session_state.wra_boundary, st.session_state.wra_layout,
+                        [r["weighted_hh_ws"] for r in st.session_state.wra_hh_results],
+                        "Weighted WS (m/s)", "Weighted Hub-Height Wind Speed")
+                    zf.writestr("weighted_hub_height_map.png", fig_to_png_bytes(weighted_fig))
+
+                    if st.session_state.wra_calibrated_ws is not None:
+                        cal_fig = render_wra_static_map(
+                            st.session_state.wra_boundary, st.session_state.wra_layout,
+                            st.session_state.wra_calibrated_ws, "Calibrated WS (m/s)",
+                            "Calibrated Wind Speed", cal_points=st.session_state.wra_cal_points)
+                        zf.writestr("calibrated_map.png", fig_to_png_bytes(cal_fig))
+
+                buf.seek(0)
+                st.session_state["wra_zip"] = buf.read()
+
+        if "wra_zip" in st.session_state:
+            st.download_button("Download Plots and Table (ZIP)", st.session_state["wra_zip"],
+                                file_name="wind_resource_assessment.zip", mime="application/zip")
+            st.caption("Reflects the settings selected at the moment you clicked 'Prepare' - "
+                       "click it again after changing anything above.")
+
+    st.divider()
+    if st.button("Reset Wind Resource Assessment"):
+        for _k in list(st.session_state.keys()):
+            if _k.startswith("wra_"):
                 del st.session_state[_k]
         st.rerun()
