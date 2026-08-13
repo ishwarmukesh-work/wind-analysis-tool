@@ -1197,8 +1197,7 @@ if mode == "Long-Term Correction":
                     "measurement timestamps are UTC+8.", value=0.0, step=0.5, key="meas_utc_offset")
             with tzc2:
                 model_utc_offset = st.number_input(
-                    "Modelled dataset timezone offset from UTC (hours). Most reanalysis products "
-                    "(ERA5, CFSR, MERRA-2) are already UTC (0); Vortex files are typically in "
+                    "Modelled dataset timezone offset from UTC (hours). Vortex files are typically in "
                     "local time and this is pre-filled from the file header.",
                     value=model_tz_default, step=0.5, key="model_utc_offset")
 
