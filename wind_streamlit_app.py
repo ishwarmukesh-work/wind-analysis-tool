@@ -1724,6 +1724,8 @@ elif mode == "Measurement Campaign Planning":
                 st.rerun()
 
         if st.session_state.camp_points:
+            if st.session_state.camp_points_fixed:
+                st.success("Comparison Points Fixed. See location in the table below.")
             labels = "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
             pts_df = pd.DataFrame([
                 {"Label": labels[i], "Latitude": lat, "Longitude": lon}
@@ -1772,7 +1774,7 @@ elif mode == "Measurement Campaign Planning":
                 if any(l not in points for l in combo_labels):
                     continue  # points changed since this combo was generated
                 fig = render_comparison_fig(combo_labels, points, st.session_state.camp_wind_maps)
-                show_fig(fig, width="stretch")
+                show_fig(fig, width=WIDTH_SHEAR)
 
     st.divider()
 
