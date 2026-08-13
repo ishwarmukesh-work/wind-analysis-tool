@@ -1043,7 +1043,7 @@ if mode == "Long-Term Correction":
                "monthly means, shear, wind roses, correlation and a long-term corrected wind speed.")
 
     # ------------------------------------------------------------------ STEP 1 --
-    st.header("1. Upload measurement data")
+    st.header("1. Upload Measurement Data")
     meas_file = st.file_uploader("Measurement CSV (lidar / met mast, any column layout, up to 500MB)",
                                   type="csv")
 
@@ -1054,7 +1054,7 @@ if mode == "Long-Term Correction":
 
         all_cols = list(raw_df.columns)
 
-        st.subheader("1a. Column mapping")
+        st.subheader("1a. Column Mapping")
         c1, c2 = st.columns(2)
         with c1:
             ts_col = st.selectbox("Timestamp column", all_cols)
@@ -1095,7 +1095,7 @@ if mode == "Long-Term Correction":
         st.divider()
 
         # -------------------------------------------------------------- STEP 2 --
-        st.header("2. Upload modelled wind data")
+        st.header("2. Upload Modelled Wind Data")
         st.caption("Any hourly modelled/reanalysis wind time series works here - ERA5, CFSR, "
                    "MERRA-2, Vortex, or similar.")
         model_file = st.file_uploader("Modelled wind dataset file (CSV or Vortex .txt)",
@@ -1117,7 +1117,7 @@ if mode == "Long-Term Correction":
                 model_cols = [c for c in raw_model_df.columns if c != "Timestamp"]
                 model_ts_col, model_dayfirst = "Timestamp", False
 
-                st.subheader("2a. Column mapping")
+                st.subheader("2a. Column Mapping")
                 st.caption("Timestamp is already handled automatically for Vortex files - just "
                            "confirm the wind speed and direction columns.")
                 mc1, mc2 = st.columns(2)
@@ -1155,7 +1155,7 @@ if mode == "Long-Term Correction":
 
                 model_cols = list(raw_model_df.columns)
 
-                st.subheader("2a. Column mapping")
+                st.subheader("2a. Column Mapping")
                 mc1, mc2 = st.columns(2)
                 with mc1:
                     model_ts_col = st.selectbox("Timestamp column", model_cols, key="model_ts_col")
@@ -1189,7 +1189,7 @@ if mode == "Long-Term Correction":
             if not is_vortex:
                 timestamp_diagnostics_ui(raw_model_df, model_ts_col, model_dayfirst, key_prefix="model")
 
-            st.subheader("2b. Timezone alignment")
+            st.subheader("2b. Timezone Alignment")
             tzc1, tzc2 = st.columns(2)
             with tzc1:
                 utc_offset = st.number_input(
