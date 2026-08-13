@@ -1287,7 +1287,7 @@ if mode == "Long-Term Correction":
 
             # ---- Data availability ----
             with tabs[0]:
-                st.subheader("Data availability by height and month")
+                st.subheader("Data Availability by Height and Month")
                 table = availability_table(meas_df, height_map)
                 fig = plot_availability_bars(table, threshold=min_avail)
                 show_fig(fig, width=WIDTH_AVAILABILITY)
