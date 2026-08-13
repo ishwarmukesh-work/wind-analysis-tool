@@ -31,7 +31,7 @@ mode = st.sidebar.radio(
     ["Long-Term Correction", "Measurement Campaign Planning"],
     help="Long-Term Correction: measurement + modelled data correlation and long-term "
          "wind speed. Measurement Campaign Planning: preliminary wind look-up and "
-         "LiDAR/FLiDAR siting from modelled maps, a site boundary, and a turbine layout.")
+         "LiDAR/FLiDAR siting from modelled maps, a , and a turbine layout.")
 st.sidebar.divider()
 
 plt.rcParams.update({
@@ -915,7 +915,7 @@ def render_comparison_fig(combo_labels, points, wind_maps):
 def render_full_campaign_map_fig(active_map, boundary_gdf, layout_gdf, measurement_points,
                                   best_points):
     """A single static overview combining every layer: background wind map with its
-    colour scale, site boundary, layout with per-turbine wind speed labels, the
+    colour scale, , layout with per-turbine wind speed labels, the
     candidate measurement points, and the K-Means-recommended best points -
     intended as the one "everything" figure for the download package."""
     from matplotlib.lines import Line2D
@@ -994,14 +994,14 @@ def render_full_campaign_map_fig(active_map, boundary_gdf, layout_gdf, measureme
 
 
 def build_campaign_excel(boundary_gdf, layout_gdf, wind_maps, measurement_points, best_points):
-    """One workbook: site boundary vertices, layout, layout wind speed (one column
+    """One workbook:  vertices, layout, layout wind speed (one column
     per loaded wind map), candidate measurement points, and best measurement points."""
     buf = io.BytesIO()
     with pd.ExcelWriter(buf, engine="openpyxl") as writer:
         if boundary_gdf is not None:
             bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
             pd.DataFrame({"Latitude": list(by), "Longitude": list(bx)}).to_excel(
-                writer, sheet_name="Site Boundary", index=False)
+                writer, sheet_name="", index=False)
 
         if layout_gdf is not None:
             lat = [g.y for g in layout_gdf.geometry]
@@ -1543,8 +1543,8 @@ elif mode == "Measurement Campaign Planning":
             st.session_state[_k] = _v
 
     # ------------------------------------------------------------------ STEP 1 --
-    st.header("1. Site boundary")
-    boundary_file = st.file_uploader("Site boundary (GeoJSON)", type=["geojson"],
+    st.header("1. Site Boundary")
+    boundary_file = st.file_uploader("Site Boundary (GeoJSON)", type=["geojson"],
                                       key="camp_boundary_file")
     if boundary_file is not None and st.session_state.camp_boundary is None:
         try:
@@ -1558,7 +1558,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 2 --
-    st.header("2. Wind maps (modelled data)")
+    st.header("2. Wind Maps (Modelled)")
     st.caption("Upload one or more ESRI ASCII grid (.asc) wind speed maps - e.g. Vortex map "
                "exports - each tagged with a source and height.")
     if "camp_wm_uploader_key" not in st.session_state:
@@ -1599,7 +1599,7 @@ elif mode == "Measurement Campaign Planning":
         map_keys = list(st.session_state.camp_wind_maps.keys())
         map_labels = [f"{s} @ {h} m" for s, h in map_keys]
 
-        st.write(f"**Loaded wind maps ({len(map_keys)}):**")
+        st.write(f"**Loaded Wind Maps ({len(map_keys)}):**")
         loaded_df = pd.DataFrame([{"Source": s, "Height (m)": h} for s, h in map_keys])
         st.dataframe(loaded_df, hide_index=True, width="stretch")
 
@@ -1622,7 +1622,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 3 --
-    st.header("3. Turbine layout (optional)")
+    st.header("3. Turbine Layout (Optional)")
     st.caption("Used for the best-measurement-point search (step 6) and optional wind speed "
                "labels on the map. Accepts .geojson, .gpkg, or .xlsx (with Latitude/Longitude "
                "columns) - not raw .shp, since that format is really several files bundled "
@@ -1667,7 +1667,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 4 --
-    st.header("4. Interactive map")
+    st.header("4. Interactive Map")
     if st.session_state.camp_boundary is None:
         st.info("Upload a site boundary above to see the map.")
     else:
@@ -1779,7 +1779,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 6 --
-    st.header("6. Locate best measurement points (K-Means)")
+    st.header("6. Locate Best Measurement Point(s) (K-Means)")
     st.caption("Groups your turbines into clusters, then searches inside the boundary for the "
                "point in each cluster whose modelled wind speed best represents that cluster "
                "(weighted against distance to the turbines it represents).")
@@ -1789,7 +1789,7 @@ elif mode == "Measurement Campaign Planning":
     else:
         n_clusters = st.number_input("Number of measurement locations", min_value=1, max_value=20,
                                       value=1, step=1, key="camp_n_clusters")
-        if st.button("Locate best measurement points", type="primary"):
+        if st.button("Locate Best Measurement Points", type="primary"):
             data, meta = st.session_state.camp_wind_maps[st.session_state.camp_active_map]
             boundary_gdf = st.session_state.camp_boundary
             bounds = tuple(boundary_gdf.total_bounds)
@@ -1821,7 +1821,7 @@ elif mode == "Measurement Campaign Planning":
     st.divider()
 
     # ------------------------------------------------------------------ STEP 7 --
-    st.header("7. Download all statistics")
+    st.header("7. Download All Statistics")
     st.caption("Bundles the comparison plots, an Excel workbook (site boundary, layout, "
                "layout wind speeds, and best measurement points), and one combined overview "
                "figure into a single ZIP.")
