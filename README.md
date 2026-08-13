@@ -1,6 +1,6 @@
 # Wind Resource Analysis Tool
 
-A Streamlit app with two separate tools, switchable from the sidebar:
+A Streamlit app with three separate tools, switchable from the sidebar:
 
 1. **Long-Term Correction** - measurement + modelled data correlation and
    long-term wind speed pipeline. No coding required - the user maps their
@@ -11,6 +11,13 @@ A Streamlit app with two separate tools, switchable from the sidebar:
    click on an interactive map to place candidate measurement points, compare
    wind speed across points and maps, and run an automated K-Means-based
    search for the best measurement locations relative to your layout.
+3. **Preliminary Wind Resource Assessment** - multi-source (ERA5 + CFSR) wind
+   resource assessment across a turbine layout: upload every `.asc` map for
+   each source (height auto-detected from the filename), compute a per-position
+   shear exponent for each source, extrapolate and blend to a hub height with
+   adjustable ERA5/CFSR weighting, then calibrate the result against
+   long-term-corrected measurements at known locations (site-average or
+   distance-weighted calibration factor).
 
 ## Run locally
 
@@ -92,3 +99,33 @@ Cloud build take noticeably longer - this is normal and only happens once.
    the boundary for the point in each cluster that best represents that
    cluster's modelled wind speed (weighted against distance to the turbines),
    reporting mean/max deviation for each recommended point, downloadable as CSV.
+
+## How to use - Preliminary Wind Resource Assessment
+
+1. **Site Boundary** and **Layout**: same as Measurement Campaign Planning.
+2. **Wind Maps**: upload every `.asc` file for ERA5 and for CFSR separately -
+   either drag-and-drop the whole folder (Chrome/Edge expand a dropped folder
+   automatically) or multi-select all the files. Height is read from each
+   filename (matching a `.M.<N>m` pattern, e.g. `site.M.100m.asc`, with a
+   looser fallback pattern if that's not found).
+3. **Interactive Map**: browse any loaded map with the layout overlaid.
+4. **Shear Calculation**: fits a power-law shear exponent to ERA5's own
+   heights and CFSR's own heights *separately, at every turbine position*
+   (not one number pooled across the whole site), then averages the two per
+   position - needs at least 2 heights loaded for a source to use it.
+5. **Hub Height & Weighting**: set the hub height and an ERA5/CFSR weight
+   slider (CFSR is automatically 100% minus ERA5 - no manual balancing
+   needed); extrapolates each source to hub height per position using that
+   position's own shear, then blends them, shown on an interactive map
+   coloured by wind speed, plus the site-average result.
+6. **Calibration**: add long-term-corrected wind speeds at known locations,
+   manually or via CSV (any column names - you map them), then choose:
+   - **Site Average CF**: one calibration factor applied everywhere.
+   - **Distance Weighted CF**: each turbine gets a blend of every
+     calibration point's factor, weighted by true great-circle distance and
+     a decay length you set - nearer points count more.
+   Shows the calibrated result on its own interactive map alongside the
+   calibration points, plus each point's average influence across the layout.
+7. **Download Plots and Table**: packages an Excel workbook (site boundary,
+   layout, ERA5/CFSR/weighted wind speed by position, and calibration data
+   if available) plus static map images into a ZIP.
