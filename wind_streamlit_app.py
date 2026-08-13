@@ -1344,7 +1344,7 @@ if mode == "Long-Term Correction":
 
             # ---- Shear ----
             with tabs[3]:
-                st.subheader("Shear exponent (profile method)")
+                st.subheader("Shear Exponent (Profile Fit Method)")
                 st.caption(f"Using the availability threshold set above ({min_avail}%).")
                 if shear_data is None:
                     st.warning("Fewer than 3 heights meet the availability threshold - "
