@@ -1179,17 +1179,66 @@ def compute_calibration_factors(era5_maps, cfsr_maps, cal_points, w_era5):
     return factors
 
 
+def semivariogram_exponential(h, range_km, nugget=0.0, sill=1.0):
+    """Exponential semivariogram model gamma(h). Weight solutions from kriging
+    depend only on the SHAPE of this curve, not its absolute scale, so sill=1
+    is fine for computing calibration weights."""
+    h = np.asarray(h, dtype=float)
+    return np.where(h <= 1e-9, 0.0, nugget + (sill - nugget) * (1 - np.exp(-h / range_km)))
+
+
+def ordinary_kriging_weights(cal_lats, cal_lons, target_lat, target_lon, range_km, nugget=0.05):
+    """Solves the ordinary kriging system for a single target location. Unlike
+    plain inverse-distance/exponential weighting, kriging accounts for
+    REDUNDANCY between calibration points that sit close to each other - two
+    clustered points don't each get full independent weight the way they
+    would under IDW, since they carry overlapping information. This is the
+    key reason kriging outperforms IDW-style methods for exactly this kind of
+    sparse point-to-surface interpolation problem (see literature note in the
+    Calibration section)."""
+    n = len(cal_lats)
+    if n == 1:
+        return np.array([1.0])
+
+    D = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = haversine_km(cal_lats[i], cal_lons[i], cal_lats[j], cal_lons[j])
+            D[i, j] = D[j, i] = d
+    Gamma = semivariogram_exponential(D, range_km, nugget=nugget)
+
+    A = np.ones((n + 1, n + 1))
+    A[:n, :n] = Gamma
+    A[n, n] = 0.0
+
+    d0 = np.array([haversine_km(target_lat, target_lon, cal_lats[i], cal_lons[i])
+                    for i in range(n)])
+    gamma0 = semivariogram_exponential(d0, range_km, nugget=nugget)
+    b = np.append(gamma0, 1.0)
+
+    try:
+        sol = np.linalg.solve(A, b)
+    except np.linalg.LinAlgError:
+        sol = np.linalg.lstsq(A, b, rcond=None)[0]
+    return sol[:n]
+
+
 def apply_calibration(weighted_hh_ws_list, layout_coords, factors, method, decay_km=250.0):
     """Site Average CF: one calibration factor applied uniformly everywhere.
     Distance Weighted CF: each turbine's factor is an exponential-decay-weighted
     blend of every calibration point's factor, using true great-circle distance.
+    Kriging (Ordinary): a geostatistical blend using the same distance decay as
+    a semivariogram range, but correctly down-weighting clustered/redundant
+    calibration points rather than treating each as independent evidence.
     Returns (calibrated_ws_list, influence_list) or (None, None) if no factors."""
     n_cal = len(factors)
     if n_cal == 0:
         return None, None
 
+    cf_vals = np.array([f["cf"] for f in factors])
+
     if method == "Site Average CF":
-        avg_cf = np.mean([f["cf"] for f in factors])
+        avg_cf = np.mean(cf_vals)
         calibrated = [w * avg_cf if not np.isnan(w) else np.nan for w in weighted_hh_ws_list]
         return calibrated, [1.0 / n_cal] * n_cal
 
@@ -1199,14 +1248,58 @@ def apply_calibration(weighted_hh_ws_list, layout_coords, factors, method, decay
         if np.isnan(w_ws):
             calibrated.append(np.nan)
             continue
-        dists = np.array([haversine_km(lat, lon, f["lat"], f["lon"]) for f in factors])
-        w = np.exp(-dists / decay_km)
-        w_norm = w / np.sum(w)
+        if method == "Kriging (Ordinary)":
+            cal_lats = [f["lat"] for f in factors]
+            cal_lons = [f["lon"] for f in factors]
+            w_norm = ordinary_kriging_weights(cal_lats, cal_lons, lat, lon, decay_km)
+        else:  # Distance Weighted CF
+            dists = np.array([haversine_km(lat, lon, f["lat"], f["lon"]) for f in factors])
+            w = np.exp(-dists / decay_km)
+            w_norm = w / np.sum(w)
         weight_tracker += w_norm
-        cf_local = np.sum(w_norm * np.array([f["cf"] for f in factors]))
+        cf_local = np.sum(w_norm * cf_vals)
         calibrated.append(w_ws * cf_local)
     influence = (weight_tracker / len(layout_coords)).tolist()
     return calibrated, influence
+
+
+@st.cache_data(show_spinner="Cross-validating calibration methods...")
+def loocv_calibration_errors(factors, methods, decay_km=250.0):
+    """Leave-one-out cross-validation: for each calibration point, predict it
+    using ONLY the other points, and compare to its actual measurement. This
+    is the standard way the wind resource literature evaluates which spatial
+    calibration approach actually performs best for a given set of points -
+    rather than assuming one method is best, check empirically. Needs >=2
+    points; more points make the comparison more informative."""
+    results = {}
+    for method in methods:
+        errors = []
+        for i, held_out in enumerate(factors):
+            remaining = factors[:i] + factors[i + 1:]
+            if not remaining:
+                continue
+            cf_vals = np.array([f["cf"] for f in remaining])
+            if method == "Site Average CF":
+                pred_cf = np.mean(cf_vals)
+            elif method == "Kriging (Ordinary)":
+                lats = [f["lat"] for f in remaining]
+                lons = [f["lon"] for f in remaining]
+                w = ordinary_kriging_weights(lats, lons, held_out["lat"], held_out["lon"], decay_km)
+                pred_cf = np.sum(w * cf_vals)
+            else:
+                dists = np.array([haversine_km(held_out["lat"], held_out["lon"], f["lat"], f["lon"])
+                                   for f in remaining])
+                w = np.exp(-dists / decay_km)
+                pred_cf = np.sum((w / np.sum(w)) * cf_vals)
+            pred_ws = held_out["model_ws"] * pred_cf
+            errors.append(pred_ws - held_out["meas_ws"])
+        if errors:
+            errors = np.array(errors)
+            results[method] = {"rmse": float(np.sqrt(np.mean(errors ** 2))),
+                                "mae": float(np.mean(np.abs(errors))), "n": len(errors)}
+        else:
+            results[method] = {"rmse": np.nan, "mae": np.nan, "n": 0}
+    return results
 
 
 def build_results_map_fig(boundary_gdf, layout_gdf, values, value_label, cal_points=None):
@@ -1222,7 +1315,7 @@ def build_results_map_fig(boundary_gdf, layout_gdf, values, value_label, cal_poi
     if boundary_gdf is not None:
         bx, by = boundary_gdf.geometry.iloc[0].exterior.coords.xy
         fig.add_trace(go.Scatter(x=list(bx), y=list(by), mode="lines",
-                                  line=dict(color="black", width=2),
+                                  line=dict(color="white", width=2),
                                   showlegend=False, hoverinfo="skip"))
 
     if layout_gdf is not None:
@@ -1233,8 +1326,8 @@ def build_results_map_fig(boundary_gdf, layout_gdf, values, value_label, cal_poi
             x=lx, y=ly, mode="markers+text",
             marker=dict(size=14, color=values, colorscale="Viridis", showscale=True,
                         colorbar=dict(title=value_label),
-                        line=dict(color="black", width=1)),
-            text=text, textposition="top center", textfont=dict(color="black", size=9),
+                        line=dict(color="white", width=1)),
+            text=text, textposition="top center", textfont=dict(color="white", size=9),
             name="Layout", showlegend=False,
             hovertemplate="%{text} m/s<extra></extra>"))
 
@@ -1246,8 +1339,9 @@ def build_results_map_fig(boundary_gdf, layout_gdf, values, value_label, cal_poi
                   for p in cal_points]
         fig.add_trace(go.Scatter(x=cx, y=cy, mode="markers+text",
                                   marker=dict(symbol="star", size=16, color="red",
-                                              line=dict(color="black", width=1)),
+                                              line=dict(color="white", width=1)),
                                   text=ctxt, textposition="bottom center",
+                                  textfont=dict(color="white", size=10),
                                   hovertext=chover, hoverinfo="text",
                                   name="Calibration point", showlegend=False))
 
@@ -2419,9 +2513,29 @@ elif mode == "Preliminary Wind Resource Assessment":
     st.caption("Adjusts the modelled result toward long-term-corrected measurements at known "
                "locations. For each point, the model's wind speed is computed directly at that "
                "point's own location and height, compared to the measured value to get a "
-               "calibration factor (CF) - then either one site-wide average CF is applied "
-               "everywhere, or each turbine gets a distance-weighted blend of every point's CF "
-               "(nearer points count more, using true great-circle distance).")
+               "calibration factor (CF), applied either as one site-wide average, a "
+               "distance-weighted blend (nearer points count more), or via kriging.")
+    with st.expander("Why three methods, and which should I use?"):
+        st.markdown(
+            "With a single calibration point, all three methods give the same result. With "
+            "multiple points, the literature is fairly consistent: a plain average of the "
+            "nearest predictor is usually beaten by distance-weighting several predictors "
+            "(Bechmann et al., *Wind Energy Science*, 2020, validated across 185 met masts at "
+            "40 sites), and several recent comparisons of spatial interpolation methods for "
+            "wind speed - including a 2025 offshore-buoy study over the Mediterranean and a "
+            "2025 station-network study - found ordinary kriging consistently gave the lowest "
+            "prediction error among the methods tested, including inverse-distance weighting. "
+            "\n\nThe reason is that kriging accounts for *redundancy*: two calibration points "
+            "sitting close together carry mostly the same information, but plain distance "
+            "weighting still counts them as two independent votes, while kriging correctly "
+            "down-weights that overlap. This matters most once you have 3 or more points, "
+            "especially if any are clustered.\n\n"
+            "Rather than picking a method by assumption, use the **cross-validation table** "
+            "below (available once you have 2+ points) - it leaves each point out in turn, "
+            "predicts it from the rest, and reports the actual error for each method on "
+            "*your* data. That is the same leave-one-out approach the literature itself uses "
+            "to compare calibration methods, and it will tell you directly which method is "
+            "performing best for this specific site rather than in general.")
 
     if st.session_state.wra_hh_results is None:
         st.info("Compute Hub Height Wind Speed above first.")
@@ -2495,27 +2609,59 @@ elif mode == "Preliminary Wind Resource Assessment":
             st.subheader("7b. Run calibration")
             mcol1, mcol2 = st.columns(2)
             with mcol1:
-                wra_cal_method = st.radio("Calibration method",
-                                           ["Site Average CF", "Distance Weighted CF"],
-                                           key="wra_cal_method")
+                wra_cal_method = st.radio(
+                    "Calibration method",
+                    ["Site Average CF", "Distance Weighted CF", "Kriging (Ordinary)"],
+                    key="wra_cal_method",
+                    help="Kriging accounts for redundancy between calibration points that "
+                         "sit close together (they don't each get full independent weight "
+                         "the way Distance Weighted CF would give them) - generally the more "
+                         "statistically sound choice once you have 3+ points. See the "
+                         "cross-validation comparison below to check which fits your data best.")
             with mcol2:
-                wra_decay_km = st.number_input("Decay length (km)", min_value=1.0, value=250.0,
-                                                step=10.0, key="wra_decay_km",
-                                                disabled=(wra_cal_method == "Site Average CF"))
+                wra_decay_km = st.number_input(
+                    "Decay / range length (km)", min_value=1.0, value=250.0, step=10.0,
+                    key="wra_decay_km", disabled=(wra_cal_method == "Site Average CF"))
+
+            # Factors computed eagerly (cheap, cached) so a cross-validation comparison can be
+            # shown before the user commits to a method.
+            w_era5 = st.session_state.get("wra_era5_weight_pct", 67) / 100
+            preview_factors = compute_calibration_factors(
+                era5_maps, cfsr_maps, st.session_state.wra_cal_points, w_era5)
+
+            if len(preview_factors) >= 2:
+                with st.expander("Cross-validation: which method fits your points best?",
+                                  expanded=True):
+                    st.caption(
+                        "Leave-one-out: each calibration point is predicted using only the "
+                        "OTHER points, then compared to its actual measurement. Lower RMSE/MAE "
+                        "means that method fits your specific points better - this is the "
+                        "standard way the wind resource literature evaluates spatial "
+                        "calibration methods rather than assuming one is universally best.")
+                    loocv = loocv_calibration_errors(
+                        preview_factors,
+                        ["Site Average CF", "Distance Weighted CF", "Kriging (Ordinary)"],
+                        decay_km=wra_decay_km)
+                    loocv_df = pd.DataFrame([
+                        {"Method": m, "RMSE (m/s)": round(r["rmse"], 3),
+                         "MAE (m/s)": round(r["mae"], 3), "Points used": r["n"]}
+                        for m, r in loocv.items()
+                    ])
+                    st.dataframe(loocv_df, hide_index=True, width="stretch")
+            elif len(preview_factors) == 1:
+                st.caption("Add at least one more calibration point to enable a "
+                           "cross-validation comparison between methods.")
 
             if st.button("Start Calibration", type="primary"):
-                w_era5 = st.session_state.get("wra_era5_weight_pct", 67) / 100
-                factors = compute_calibration_factors(era5_maps, cfsr_maps,
-                                                        st.session_state.wra_cal_points, w_era5)
-                if not factors:
+                if not preview_factors:
                     st.error("No valid calibration factors - check the points fall within the "
                              "wind map coverage.")
                 else:
                     layout_coords = tuple((g.y, g.x) for g in st.session_state.wra_layout.geometry)
                     weighted_list = [r["weighted_hh_ws"] for r in st.session_state.wra_hh_results]
                     calibrated, influence = apply_calibration(
-                        weighted_list, layout_coords, factors, wra_cal_method, wra_decay_km)
-                    st.session_state.wra_cal_factors = factors
+                        weighted_list, layout_coords, preview_factors, wra_cal_method, wra_decay_km)
+                    st.session_state.wra_cal_factors = preview_factors
                     st.session_state.wra_calibrated_ws = calibrated
                     st.session_state.wra_cal_influence = influence
 
