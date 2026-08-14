@@ -2300,14 +2300,16 @@ elif mode == "Preliminary Wind Resource Assessment":
                    ("wra_wind_maps", {"ERA5": {}, "CFSR": {}}), ("wra_active_map", None),
                    ("wra_shear_results", None), ("wra_hh_results", None),
                    ("wra_cal_points", []), ("wra_cal_factors", None),
-                   ("wra_calibrated_ws", None), ("wra_cal_influence", None)]:
+                   ("wra_calibrated_ws", None), ("wra_cal_influence", None),
+                   ("wra_uploader_gen", 0)]:
         if _k not in st.session_state:
             st.session_state[_k] = _v
+    _gen = st.session_state.wra_uploader_gen
 
     # ------------------------------------------------------------------ STEP 1 --
     st.header("1. Site Boundary")
     wra_boundary_file = st.file_uploader("Site boundary (GeoJSON)", type=["geojson"],
-                                          key="wra_boundary_file")
+                                          key=f"wra_boundary_file_{_gen}")
     if wra_boundary_file is not None and st.session_state.wra_boundary is None:
         try:
             st.session_state.wra_boundary = read_geo_file_from_bytes(
@@ -2322,7 +2324,8 @@ elif mode == "Preliminary Wind Resource Assessment":
     # ------------------------------------------------------------------ STEP 2 --
     st.header("2. Layout")
     wra_layout_file = st.file_uploader("Layout file (.geojson, .gpkg, or .xlsx)",
-                                        type=["geojson", "gpkg", "xlsx"], key="wra_layout_file")
+                                        type=["geojson", "gpkg", "xlsx"],
+                                        key=f"wra_layout_file_{_gen}")
     if wra_layout_file is not None:
         fname = wra_layout_file.name
         if fname.lower().endswith(".xlsx"):
@@ -2368,7 +2371,8 @@ elif mode == "Preliminary Wind Resource Assessment":
         with _col:
             st.subheader(_source)
             _files = st.file_uploader(f"{_source} .asc files", type=["asc"],
-                                       accept_multiple_files=True, key=f"wra_{_source.lower()}_files")
+                                       accept_multiple_files=True,
+                                       key=f"wra_{_source.lower()}_files_{_gen}")
             if _files:
                 _maps, _skipped = {}, []
                 for _f in _files:
@@ -2564,7 +2568,7 @@ elif mode == "Preliminary Wind Resource Assessment":
                 st.session_state.wra_cal_points = []
 
         st.caption("Or import a CSV of calibration points (any column names - you map them below).")
-        cal_csv = st.file_uploader("Calibration CSV", type=["csv"], key="wra_cal_csv")
+        cal_csv = st.file_uploader("Calibration CSV", type=["csv"], key=f"wra_cal_csv_{_gen}")
         if cal_csv is not None:
             cal_raw = pd.read_csv(cal_csv)
             cal_cols = list(cal_raw.columns)
@@ -2698,6 +2702,13 @@ elif mode == "Preliminary Wind Resource Assessment":
     if st.session_state.wra_hh_results is None:
         st.info("Compute Hub Height Wind Speed above first.")
     else:
+        wra_file_basename = st.text_input(
+            "File name (e.g. project or site name)", value="project",
+            key=f"wra_file_basename_{_gen}",
+            help="The download will be saved as '<this>_prelim_wra.zip'.")
+        _safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", wra_file_basename.strip()) or "project"
+        _download_filename = f"{_safe_name}_prelim_wra.zip"
+
         if st.button("Prepare download package"):
             with st.spinner("Building download package..."):
                 buf = io.BytesIO()
@@ -2725,16 +2736,24 @@ elif mode == "Preliminary Wind Resource Assessment":
 
                 buf.seek(0)
                 st.session_state["wra_zip"] = buf.read()
+                st.session_state["wra_zip_filename"] = _download_filename
 
         if "wra_zip" in st.session_state:
             st.download_button("Download Plots and Table (ZIP)", st.session_state["wra_zip"],
-                                file_name="wind_resource_assessment.zip", mime="application/zip")
+                                file_name=st.session_state.get("wra_zip_filename", _download_filename),
+                                mime="application/zip")
             st.caption("Reflects the settings selected at the moment you clicked 'Prepare' - "
                        "click it again after changing anything above.")
 
     st.divider()
     if st.button("Reset Wind Resource Assessment"):
+        _next_gen = st.session_state.get("wra_uploader_gen", 0) + 1
         for _k in list(st.session_state.keys()):
             if _k.startswith("wra_"):
                 del st.session_state[_k]
+        # Bump AFTER wiping, so every file_uploader above gets a brand-new key and
+        # genuinely resets - deleting the session_state value alone isn't enough, since
+        # the browser-side widget still holds its selected file(s) and would otherwise
+        # silently re-populate everything right back on the very next rerun.
+        st.session_state.wra_uploader_gen = _next_gen
         st.rerun()
