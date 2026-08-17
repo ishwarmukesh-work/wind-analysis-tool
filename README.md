@@ -3,7 +3,7 @@
 A Streamlit app with three separate tools, switchable from the sidebar:
 
 1. **Long-Term Correction** - measurement + modelled data correlation and
-   long-term wind speed pipeline. No coding required - the user maps their
+   long-term wind speed pipeline. The user maps their
    own CSV columns interactively.
 2. **Measurement Campaign Planning** - preliminary wind resource look-up and
    LiDAR/FLiDAR siting: upload a site boundary, a turbine layout, and one or
