@@ -1463,10 +1463,20 @@ if mode == "Long-Term Correction":
     st.caption("Upload your measurement data and a modelled wind dataset to get availability, "
                "monthly means, shear, wind roses, correlation and a long-term corrected wind speed.")
 
+    if "ltc_uploader_gen" not in st.session_state:
+        st.session_state.ltc_uploader_gen = 0
+    _ltc_gen = st.session_state.ltc_uploader_gen
+
+    if st.button("Reset Long-Term Correction"):
+        st.session_state.ltc_uploader_gen += 1
+        if "plots_zip" in st.session_state:
+            del st.session_state["plots_zip"]
+        st.rerun()
+
     # ------------------------------------------------------------------ STEP 1 --
     st.header("1. Upload measurement data")
     meas_file = st.file_uploader("Measurement CSV (lidar / met mast, any column layout, up to 500MB)",
-                                  type="csv")
+                                  type="csv", key=f"ltc_meas_file_{_ltc_gen}")
 
     if meas_file is not None:
         raw_df = read_raw_csv(meas_file.getvalue())
@@ -1520,7 +1530,7 @@ if mode == "Long-Term Correction":
         st.caption("Any hourly modelled/reanalysis wind time series works here - ERA5, CFSR, "
                    "MERRA-2, Vortex, or similar.")
         model_file = st.file_uploader("Modelled wind dataset file (CSV or Vortex .txt)",
-                                       type=["csv", "txt"], key="model_file")
+                                       type=["csv", "txt"], key=f"ltc_model_file_{_ltc_gen}")
 
         if model_file is not None:
             model_bytes = model_file.getvalue()
@@ -1959,14 +1969,16 @@ elif mode == "Measurement Campaign Planning":
 
     for _k, _v in [("camp_wind_maps", {}), ("camp_active_map", None), ("camp_boundary", None),
                    ("camp_layout", None), ("camp_points", []), ("camp_points_fixed", False),
-                   ("camp_best_points", []), ("camp_last_click", None)]:
+                   ("camp_best_points", []), ("camp_last_click", None),
+                   ("camp_uploader_gen", 0), ("camp_wm_uploader_gen", 0)]:
         if _k not in st.session_state:
             st.session_state[_k] = _v
+    _cgen = st.session_state.camp_uploader_gen
 
     # ------------------------------------------------------------------ STEP 1 --
     st.header("1. Site boundary")
     boundary_file = st.file_uploader("Site boundary (GeoJSON)", type=["geojson"],
-                                      key="camp_boundary_file")
+                                      key=f"camp_boundary_file_{_cgen}")
     if boundary_file is not None and st.session_state.camp_boundary is None:
         try:
             st.session_state.camp_boundary = read_geo_file_from_bytes(
@@ -1984,8 +1996,6 @@ elif mode == "Measurement Campaign Planning":
                "ERA5 or CFSR folder (Chrome/Edge expand a dropped folder automatically) or "
                "select all the files. Height is read from each filename (e.g. "
                "'site.M.100m.asc'), so there's no need to add maps one at a time.")
-    if "camp_wm_uploader_gen" not in st.session_state:
-        st.session_state.camp_wm_uploader_gen = 0
 
     wc1, wc2 = st.columns([1, 3])
     with wc1:
@@ -2058,7 +2068,7 @@ elif mode == "Measurement Campaign Planning":
                "columns) - not raw .shp, since that format is really several files bundled "
                "together; export or convert to one of these instead.")
     layout_file = st.file_uploader("Layout file", type=["geojson", "gpkg", "xlsx"],
-                                    key="camp_layout_file")
+                                    key=f"camp_layout_file_{_cgen}")
     if layout_file is not None:
         fname = layout_file.name
         if fname.lower().endswith(".xlsx"):
@@ -2295,9 +2305,17 @@ elif mode == "Measurement Campaign Planning":
 
     st.divider()
     if st.button("Reset planning tool"):
+        _next_cgen = st.session_state.get("camp_uploader_gen", 0) + 1
+        _next_wmgen = st.session_state.get("camp_wm_uploader_gen", 0) + 1
         for _k in list(st.session_state.keys()):
             if _k.startswith("camp_"):
                 del st.session_state[_k]
+        # Bump AFTER wiping, so every file_uploader above gets a brand-new key and
+        # genuinely resets - deleting the session_state value alone isn't enough, since
+        # the browser-side widget still holds its selected file(s) and would otherwise
+        # silently re-populate everything right back on the very next rerun.
+        st.session_state.camp_uploader_gen = _next_cgen
+        st.session_state.camp_wm_uploader_gen = _next_wmgen
         st.rerun()
 
 elif mode == "Preliminary Wind Resource Assessment":
