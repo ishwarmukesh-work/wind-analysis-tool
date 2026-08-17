@@ -1980,41 +1980,50 @@ elif mode == "Measurement Campaign Planning":
 
     # ------------------------------------------------------------------ STEP 2 --
     st.header("2. Wind maps (modelled data)")
-    st.caption("Upload one or more ESRI ASCII grid (.asc) wind speed maps - e.g. Vortex map "
-               "exports - each tagged with a source and height.")
-    if "camp_wm_uploader_key" not in st.session_state:
-        st.session_state.camp_wm_uploader_key = 0
+    st.caption("Upload every .asc file for a source at once - e.g. drag-and-drop the whole "
+               "ERA5 or CFSR folder (Chrome/Edge expand a dropped folder automatically) or "
+               "select all the files. Height is read from each filename (e.g. "
+               "'site.M.100m.asc'), so there's no need to add maps one at a time.")
+    if "camp_wm_uploader_gen" not in st.session_state:
+        st.session_state.camp_wm_uploader_gen = 0
 
-    wc1, wc2, wc3 = st.columns([1, 1, 2])
+    wc1, wc2 = st.columns([1, 3])
     with wc1:
         wm_source = st.text_input("Source label", value="ERA5", key="camp_wm_source")
     with wc2:
-        wm_height = st.number_input("Height (m)", min_value=1.0, value=100.0, step=1.0,
-                                     key="camp_wm_height")
-    with wc3:
-        wm_file = st.file_uploader(
-            "Wind map (.asc)", type=["asc"],
-            key=f"camp_wm_file_{st.session_state.camp_wm_uploader_key}")
+        wm_files = st.file_uploader(
+            "Wind map files (.asc)", type=["asc"], accept_multiple_files=True,
+            key=f"camp_wm_files_{st.session_state.camp_wm_uploader_gen}")
 
-    if st.button("Add wind map"):
-        if wm_file is None:
-            st.error("Choose a .asc file first.")
+    if st.button("Add these wind maps"):
+        if not wm_files:
+            st.error("Choose at least one .asc file first.")
         else:
-            wm_key = (wm_source.strip(), f"{wm_height:.0f}")
-            if wm_key in st.session_state.camp_wind_maps:
-                st.error("A map with this source/height is already loaded.")
-            else:
-                try:
-                    data, meta = read_ascii_grid(wm_file.getvalue())
-                    st.session_state.camp_wind_maps[wm_key] = (data, meta)
-                    st.session_state.camp_active_map = wm_key
-                    # Bump the uploader's key so it resets to empty instead of
-                    # continuing to show the just-added file.
-                    st.session_state.camp_wm_uploader_key += 1
-                    st.success(f"Added {wm_source} @ {wm_height:.0f} m")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"Could not read wind map: {e}")
+            added, skipped, duplicates = [], [], []
+            for f in wm_files:
+                h = detect_asc_height(f.name)
+                if h is None:
+                    skipped.append(f.name)
+                    continue
+                wm_key = (wm_source.strip(), f"{h:.0f}")
+                if wm_key in st.session_state.camp_wind_maps:
+                    duplicates.append(f"{wm_source} @ {h:.0f} m")
+                    continue
+                data, meta = cached_read_ascii_grid(f.getvalue())
+                st.session_state.camp_wind_maps[wm_key] = (data, meta)
+                st.session_state.camp_active_map = wm_key
+                added.append(f"{wm_source} @ {h:.0f} m")
+            # Bump the uploader's key so it resets to empty instead of continuing to
+            # show the just-added files.
+            st.session_state.camp_wm_uploader_gen += 1
+            if added:
+                st.success(f"Added {len(added)} map(s): {', '.join(added)}")
+            if duplicates:
+                st.warning(f"Already loaded, skipped: {', '.join(duplicates)}")
+            if skipped:
+                st.warning(f"Could not detect height from {len(skipped)} file(s): "
+                           f"{', '.join(skipped[:5])}{' ...' if len(skipped) > 5 else ''}")
+            st.rerun()
 
     if st.session_state.camp_wind_maps:
         map_keys = list(st.session_state.camp_wind_maps.keys())
